@@ -172,6 +172,22 @@ test('engines.node the pinned Node does not satisfy, or in an unreadable form, i
   }
 });
 
+test('a lockfile with an install script is refused, citing the contract', async () => {
+  const t = setup();
+  try {
+    fs.writeFileSync(path.join(t.seed, 'package-lock.json'), JSON.stringify({
+      lockfileVersion: 3,
+      packages: { '': { name: 'code-conductor' }, 'node_modules/ok': { version: '1.0.0' }, 'node_modules/native': { version: '1.0.0', hasInstallScript: true } },
+    }));
+    t.commit('native dep');
+    t.push('main');
+    const err = await buildInstaller(opts(t)).then(() => assert.fail('built'), (e) => e);
+    assert.match(err.message, /package-lock\.json has packages with install scripts: node_modules\/native$/m);
+    assert.ok(err.message.includes(CONTRACT_URL));
+    assert.equal(t.ran(), false);
+  } finally { t.cleanup(); }
+});
+
 test('a commit off the branch warns that self-update will report ahead or diverged', async () => {
   const t = setup();
   try {

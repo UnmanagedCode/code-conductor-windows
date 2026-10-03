@@ -44,6 +44,26 @@ export function runLogged(log, file, args, { cwd, env } = {}) {
   });
 }
 
+// Runs a PowerShell script with `input` on stdin -> {code, stdout, stderr}.
+// The script goes in as -EncodedCommand (UTF-16LE), so no quoting or code
+// page touches it. `exe` is injectable so a test can run real pwsh.
+export function runPowerShell(script, input, exe = 'powershell.exe') {
+  return new Promise((resolve, reject) => {
+    const encoded = Buffer.from(script, 'utf16le').toString('base64');
+    const c = spawn(exe, ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    c.stdout.on('data', (d) => { stdout += d; });
+    c.stderr.on('data', (d) => { stderr += d; });
+    c.on('error', reject);
+    c.on('close', (code) => resolve({ code: code ?? -1, stdout, stderr }));
+    // A child that exits without reading stdin (EPIPE) is judged by its exit
+    // code: a write script that got no input fails to parse it and exits 1.
+    c.stdin.on('error', () => {});
+    c.stdin.end(input);
+  });
+}
+
 async function mustRun(log, file, args, opts) {
   const code = await runLogged(log, file, args, opts);
   if (code !== 0) throw new Error(`${path.basename(file)} ${args.slice(0, 2).join(' ')} failed (exit ${code})`);
@@ -160,17 +180,7 @@ export async function main(argv, env = process.env) {
   const claude = await ensureClaude({ env, log });
   const home = getEnv(env, 'USERPROFILE');
   if (home && claude.dir.toLowerCase() === w.join(home, '.local', 'bin').toLowerCase()) {
-    const added = await addToUserPath(claude.dir, {
-      reg: (a) => new Promise((resolve) => {
-        const c = spawn('reg.exe', a, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-        let stdout = '';
-        let stderr = '';
-        c.stdout.on('data', (d) => { stdout += d; });
-        c.stderr.on('data', (d) => { stderr += d; });
-        c.on('close', (code) => resolve({ code: code ?? -1, stdout, stderr }));
-      }),
-      env,
-    });
+    const added = await addToUserPath(claude.dir, { runPs: runPowerShell, env });
     log(added ? `path: added ${claude.dir} to the user PATH` : `path: ${claude.dir} already on the user PATH`);
   }
 

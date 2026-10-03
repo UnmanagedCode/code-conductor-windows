@@ -83,6 +83,14 @@ function checkContract(git, commit, nodeVersion) {
     try { pkg = JSON.parse(shown.stdout); } catch (e) { problems.push(`package.json does not parse: ${e.message}`); }
   }
   if (typeof pkg.version !== 'string') problems.push('package.json has no string "version"');
+  // `npm ci` on the user's machine has only the bundled node + npm, no build toolchain.
+  const lock = git(['show', `${commit}:package-lock.json`], { allowFail: true });
+  if (lock.status === 0) {
+    try {
+      const scripted = Object.entries(JSON.parse(lock.stdout).packages ?? {}).filter(([, p]) => p.hasInstallScript).map(([k]) => k);
+      if (scripted.length) problems.push(`package-lock.json has packages with install scripts: ${scripted.join(', ')}`);
+    } catch (e) { problems.push(`package-lock.json does not parse: ${e.message}`); }
+  }
   const range = pkg.engines?.node;
   const ok = typeof range === 'string' ? satisfiesEngines(nodeVersion, range) : null;
   if (ok === null) problems.push(`package.json engines.node ${JSON.stringify(range)} is not of the form >=N[.N[.N]]`);
@@ -122,7 +130,7 @@ export async function buildInstaller({
     const short = commit.slice(0, 8);
     log(`cc: ${ref} is ${commit}`);
     const { version } = checkContract(git, commit, pins.node.version);
-    log(`cc: contract checks passed (${LAUNCHER_REL}, package.json version ${version}, engines.node, package-lock.json, LICENSE)`);
+    log(`cc: contract checks passed (${LAUNCHER_REL}, package.json version ${version}, engines.node, package-lock.json without install scripts, LICENSE)`);
 
     const branchRef = `refs/remotes/src/${branch}`;
     if (resolve(branchRef) && git(['merge-base', '--is-ancestor', commit, branchRef], { allowFail: true }).status !== 0) {

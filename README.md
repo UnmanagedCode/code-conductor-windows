@@ -11,9 +11,9 @@ Run `code-conductor-setup-<version>-<commit>.exe` as the user who will use cc. T
 1. Stops a running cc first, after asking (through the launcher's `--status`/`--stop`). It aborts if something answers on cc's port but can't be identified.
 2. Replaces `node\` with the bundled Node.
 3. Runs `setup.mjs` with that Node. Progress goes to the details pane and `logs\setup.log`:
-   - **Git for Windows:** uses an existing Git that has Git Bash (`git.exe` in `<root>\cmd` or `<root>\bin`, plus `<root>\bin\bash.exe`), found on PATH, in `%LOCALAPPDATA%\Programs\Git` or in `%ProgramFiles%\Git`. Otherwise it downloads the pinned Git installer, checks its sha256 and installs it per-user (`/CURRENTUSER`, Git's `cmd` on PATH).
+   - **Git for Windows:** uses an existing Git that has Git Bash (`git.exe` in `<root>\cmd` or `<root>\bin`, plus `<root>\bin\bash.exe`), found on PATH, in `%LOCALAPPDATA%\Programs\Git` or in `%ProgramFiles%\Git`. A `git.exe` in `usr\bin`, `mingw64\bin` or `mingw32\bin` (Git's "optional Unix tools" PATH option) does not count. Setup uses the install's own `cmd\git.exe` (else `bin\git.exe`). Otherwise it downloads the pinned Git installer, checks its sha256 and installs it per-user (`/CURRENTUSER`, Git's `cmd` on PATH).
    - **Claude Code:** uses `claude.exe` on PATH (an npm `.cmd` shim does not count) or `%USERPROFILE%\.local\bin\claude.exe`. Otherwise it runs the official installer (`irm https://claude.ai/install.ps1 | iex`).
-   - **User PATH:** appends `%USERPROFILE%\.local\bin` to the user `Path` (`HKCU\Environment`) if it is absent, keeping the existing entries and any `%VAR%` in them.
+   - **User PATH:** appends `%USERPROFILE%\.local\bin` to the user `Path` (`HKCU\Environment`) if it is absent, keeping the existing entries, any `%VAR%` in them, non-ASCII characters and the value's kind (a new value is `REG_EXPAND_SZ`). It reads and writes through PowerShell's .NET registry API, not `reg.exe`, whose output is in the console code page. A Path it cannot read, or of a kind other than `REG_SZ`/`REG_EXPAND_SZ`, aborts setup rather than being overwritten.
    - **Checkout:** a fresh install clones the bundled cc into `app\` (LF line endings, `core.autocrlf=false`, branch with upstream) and points `origin` at GitHub. An existing checkout is fast-forwarded to the bundled commit, and never downgraded or clobbered: if local changes block the fast-forward, it is kept and self-update handles it later.
    - **Dependencies:** `npm ci` in `app\` with the bundled Node and npm.
 4. Writes `code-conductor.exe` (the Start-menu stub), `uninstall.exe`, the Start-menu shortcut and the Apps & features entry.
@@ -103,6 +103,7 @@ Output: `build/code-conductor-setup-<package.json version>-<short8 sha>.exe`. Re
 3. Resolves `--ref`; an unknown ref is refused.
 4. Checks the commit against the contract and refuses with the contract URL if any check fails:
    - `bin/windows-launch.mjs` (`LAUNCHER_REL`), `package.json`, `package-lock.json` and `LICENSE` exist;
+   - no `package-lock.json` `packages` entry has `hasInstallScript` (`npm ci` gets no build toolchain);
    - `version` is a string;
    - `engines.node` has the form `>=N[.N[.N]]` and the pinned Node satisfies it.
 5. Warns if the commit is not on `--branch` at the source: self-update would then report ahead or diverged.
@@ -121,6 +122,7 @@ Output: `build/code-conductor-setup-<package.json version>-<short8 sha>.exe`. Re
 ```
 npm test                                        # node --test, no network, no deps
 RUN_WIN_INSTALLER_BUILD=1 node --test tests/build.real.test.mjs
+PWSH=<path to pwsh or powershell.exe> node --test tests/userpath.pwsh.test.mjs
 ```
 
 | File | Covers |
@@ -129,4 +131,5 @@ RUN_WIN_INSTALLER_BUILD=1 node --test tests/build.real.test.mjs
 | `tests/build.real.test.mjs` | Gated by `RUN_WIN_INSTALLER_BUILD=1`: a real fetch, the pinned Node download and real `makensis` produce a PE exe over 20 MB. `CC_SOURCE`/`CC_REF` override the GitHub default and `main` |
 | `tests/checkout.test.mjs` | `checkout()` with real git: fresh clone (LF, upstream, origin), fast-forward, never downgrade, a dirty tree kept |
 | `tests/setup.test.mjs` | `ensureGit` sha refusal, `downloadWithRetry` |
-| `tests/toolchain.test.mjs` | `detectGit` layouts (mirroring cc's C8), `detectClaude`, `findOnPath`, `addToUserPath` against a fake that models real `reg.exe` (exit 1 only, localized stderr) |
+| `tests/toolchain.test.mjs` | `detectGit` layouts (mirroring cc's C8, plus the rejected `usr\bin`/`mingw64\bin`), `detectClaude`, `findOnPath`, `addToUserPath` against a fake of the PowerShell channel (base64 JSON both ways, exit 1 with localized stderr, non-ASCII round-trip) |
+| `tests/userpath.pwsh.test.mjs` | Gated by `PWSH`: the real user-Path scripts run by real PowerShell through `runPowerShell`, with `HKCU\Environment` swapped for a fake key, so the encoding path is exercised end to end (non-ASCII round-trip, kinds, failure exit codes) |

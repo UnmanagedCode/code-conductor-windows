@@ -1,5 +1,5 @@
 // Tool detection and the user PATH write used by setup.mjs. Pure over an
-// injected `env` / `exists` / `reg` so Linux tests exercise the Windows logic;
+// injected `env` / `exists` / `runPs` so Linux tests exercise the Windows logic;
 // every path op is `path.win32`.
 //
 // Intentional duplication: setup.mjs runs before any cc checkout exists (it
@@ -36,28 +36,33 @@ export function findOnPath(name, env, exists = fs.existsSync) {
 }
 
 // Git's install root from a `<root>\cmd\git.exe` or `<root>\bin\git.exe`;
-// null for any other git.exe (e.g. `mingw64\bin`), which the launcher's
-// resolveGitBash would not map back to a Git Bash.
+// null for any other git.exe. That includes `usr\bin` and `mingw64\bin`
+// (Git's "optional Unix tools" PATH option): putting those first on setup's
+// PATH would put MSYS tools ahead of System32.
 function gitRootOf(gitExe) {
   const dir = w.dirname(gitExe);
-  return /^(cmd|bin)$/i.test(w.basename(dir)) ? w.dirname(dir) : null;
+  if (!/^(cmd|bin)$/i.test(w.basename(dir))) return null;
+  const root = w.dirname(dir);
+  return /^(usr|mingw64|mingw32)$/i.test(w.basename(root)) ? null : root;
 }
 
 // Git counts only with its bundled `bin\bash.exe`: Git Bash is what claude
-// needs on Windows, a bare git.exe is not enough. `cmdDir` is the found
-// git.exe's directory, the one setup puts on PATH.
+// needs on Windows, a bare git.exe is not enough. Like the launcher, the
+// git.exe used is the install's own `cmd\git.exe`, else its `bin\git.exe`;
+// `cmdDir` is its directory, the one setup puts on PATH.
 export function detectGit(env, exists = fs.existsSync) {
   const candidates = [];
-  const onPath = findOnPath('git', env, exists);
-  if (onPath) candidates.push(onPath);
+  for (const dir of splitPath(getEnv(env, 'PATH'))) candidates.push(w.join(dir.replace(/^"|"$/g, ''), 'git.exe'));
   const local = getEnv(env, 'LOCALAPPDATA');
   if (local) candidates.push(w.join(local, 'Programs', 'Git', 'cmd', 'git.exe'));
   const pf = getEnv(env, 'ProgramFiles');
   if (pf) candidates.push(w.join(pf, 'Git', 'cmd', 'git.exe'));
-  for (const gitExe of candidates) {
-    if (!exists(gitExe)) continue;
-    const root = gitRootOf(gitExe);
-    if (root && exists(w.join(root, 'bin', 'bash.exe'))) return { gitExe, cmdDir: w.dirname(gitExe) };
+  for (const candidate of candidates) {
+    if (!exists(candidate)) continue;
+    const root = gitRootOf(candidate);
+    if (!root || !exists(w.join(root, 'bin', 'bash.exe'))) continue;
+    const gitExe = ['cmd', 'bin'].map((d) => w.join(root, d, 'git.exe')).find(exists);
+    return { gitExe, cmdDir: w.dirname(gitExe) };
   }
   return null;
 }
@@ -73,31 +78,72 @@ export function detectClaude(env, exists = fs.existsSync) {
   return null;
 }
 
+// The user Path (HKCU\Environment\Path) is read and written by PowerShell
+// through .NET's registry API, never reg.exe: reg.exe prints in the console
+// code page, so a non-ASCII entry would come back mangled and be written back
+// corrupted. Only base64 of UTF-8 JSON crosses the pipes, so no code page
+// applies. `read` prints {exists, kind, value} (value unexpanded); `write`
+// takes {value, kind} on stdin, writes it and reads it back to verify. Any
+// failure exits 1 with the message on stderr.
+const PS_OPEN = {
+  read: "$k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $false)",
+  write: "$k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)",
+};
+const PS_BODY = {
+  read: `
+$v = $k.GetValue('Path', $null, 'DoNotExpandEnvironmentNames')
+if ($null -eq $v) { $o = @{ exists = $false } } else { $o = @{ exists = $true; kind = $k.GetValueKind('Path').ToString(); value = $v } }
+[Console]::Out.Write([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -Compress -InputObject $o))))`,
+  write: `
+$req = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd().Trim())) | ConvertFrom-Json
+if ($req.kind -cne 'String' -and $req.kind -cne 'ExpandString') { throw "refusing to write Path as kind $($req.kind)" }
+if ($req.value -isnot [string]) { throw 'refusing to write a non-string Path' }
+$k.SetValue('Path', $req.value, [Microsoft.Win32.RegistryValueKind]$req.kind)
+$back = $k.GetValue('Path', $null, 'DoNotExpandEnvironmentNames')
+if ($back -cne $req.value -or $k.GetValueKind('Path').ToString() -cne $req.kind) { throw 'Path read back differs from what was written' }`,
+};
+
+// The PowerShell script for `op` ('read' | 'write'). `openKey` is the line
+// that sets `$k`; tests swap it for a fake key.
+export function userPathScript(op, openKey = PS_OPEN[op]) {
+  return `$ErrorActionPreference = 'Stop'
+try {
+${openKey}
+if ($null -eq $k) { throw 'HKCU\\Environment could not be opened' }
+${PS_BODY[op]}
+} catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
+exit 0
+`;
+}
+
 function expandVars(value, env) {
   return value.replace(/%([^%]+)%/g, (m, n) => getEnv(env, n) ?? m);
 }
 
-// Append `dir` to the user PATH (HKCU\Environment\Path) iff absent. Goes
-// through `reg.exe` rather than NSIS ReadRegStr (1024-char truncation) and
-// writes REG_EXPAND_SZ without a shell so `%VAR%` entries stay literal.
-// `reg(args)` -> {code, stdout, stderr}. Queries the whole key, which always
-// exists, so a missing `Path` line is the only "absent"; any failed or
-// unparseable query throws without writing, since writing would replace a
-// Path we could not read. Matches value lines only, never message text,
-// which Windows localizes.
-export async function addToUserPath(dir, { reg, env = process.env }) {
-  const q = await reg(['query', 'HKCU\\Environment']);          // the key always exists
-  if (q.code !== 0) throw new Error(`reg query HKCU\\Environment failed (exit ${q.code}): ${(q.stderr || '').trim()}`);
-  if (!/^HKEY_CURRENT_USER\\Environment\s*$/im.test(q.stdout)) throw new Error('reg query HKCU\\Environment succeeded but its output could not be parsed');
-  const m = /^\s+Path\s+(REG_\w+)\s+(.*)$/im.exec(q.stdout);   // value lines are never localized
-  if (m && !/^REG_(EXPAND_)?SZ$/.test(m[1])) throw new Error(`user Path has unexpected type ${m[1]}`);
-  const current = m ? m[2].replace(/\r$/, '') : '';             // no Path line = absent
-  const entries = splitPath(current);
+// Append `dir` to the user Path iff absent, keeping its kind (a new value is
+// REG_EXPAND_SZ, so `%VAR%` entries stay literal) and never truncating.
+// `runPs(script, input)` -> {code, stdout, stderr} runs a userPathScript.
+// Fails closed: a failed or unparseable read, or a kind other than
+// REG_SZ/REG_EXPAND_SZ, throws without writing, since writing would replace
+// a Path we could not read. Only an absent value counts as empty.
+export async function addToUserPath(dir, { runPs, env = process.env }) {
+  const q = await runPs(userPathScript('read'), '');
+  if (q.code !== 0) throw new Error(`reading the user Path failed (exit ${q.code}): ${(q.stderr || '').trim()}`);
+  const out = (q.stdout || '').trim();
+  let cur = null;
+  if (/^[A-Za-z0-9+/]+={0,2}$/.test(out)) {
+    try { cur = JSON.parse(Buffer.from(out, 'base64').toString('utf8')); } catch { cur = null; }
+  }
+  if (typeof cur?.exists !== 'boolean') throw new Error('reading the user Path succeeded but its output could not be parsed');
+  if (cur.exists && cur.kind !== 'String' && cur.kind !== 'ExpandString') throw new Error(`user Path has unexpected kind ${cur.kind}`);
+  if (cur.exists && typeof cur.value !== 'string') throw new Error('user Path read back as a non-string');
+
+  const entries = splitPath(cur.exists ? cur.value : '');
   const norm = (s) => s.toLowerCase().replace(/[\\/]+$/, '');
   const want = norm(dir);
   if (entries.some((e) => norm(e) === want || norm(expandVars(e, env)) === want)) return false;
-  const next = [...entries, dir].join(';');
-  const r = await reg(['add', 'HKCU\\Environment', '/v', 'Path', '/t', 'REG_EXPAND_SZ', '/d', next, '/f']);
-  if (r.code !== 0) throw new Error(`reg add HKCU\\Environment Path failed (exit ${r.code})`);
+  const req = { value: [...entries, dir].join(';'), kind: cur.exists ? cur.kind : 'ExpandString' };
+  const r = await runPs(userPathScript('write'), Buffer.from(JSON.stringify(req), 'utf8').toString('base64'));
+  if (r.code !== 0) throw new Error(`writing the user Path failed (exit ${r.code}): ${(r.stderr || '').trim()}`);
   return true;
 }
