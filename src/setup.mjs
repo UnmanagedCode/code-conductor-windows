@@ -14,10 +14,12 @@ import { detectGit, detectClaude, addToUserPath, envKey, getEnv, splitPath } fro
 
 const w = path.win32;
 
+const stamp = (msg) => `[${new Date().toISOString()}] ${msg}`;
+
 export function makeLogger(logFile) {
   if (logFile) fs.mkdirSync(path.dirname(logFile), { recursive: true });
   return (msg) => {
-    const line = `[${new Date().toISOString()}] ${msg}`;
+    const line = stamp(msg);
     console.log(line);
     if (logFile) fs.appendFileSync(logFile, line + '\n');
   };
@@ -141,7 +143,8 @@ const RECOVER = 'To recover, uninstall code-conductor (Apps & features), then ru
 // tip: equal or ahead -> kept; behind -> fast-forwarded (kept if local
 // changes block it); diverged -> refused. Never reset: the checkout may hold
 // self-updated or local commits. Whatever is kept must have `launcher` (the
-// Start-menu entry's path in the checkout), else setup fails.
+// Start-menu entry's path in the checkout), else setup fails. Git config
+// (autocrlf, origin) is touched only once every check has passed.
 export async function checkout({ git, bundle, dir, branch, remoteUrl, launcher, log, env }) {
   const g = (args, cwd = dir) => mustRun(log, git, args, { cwd, env });
   // merge-base --is-ancestor: 0 yes, 1 no, anything else an error.
@@ -150,6 +153,7 @@ export async function checkout({ git, bundle, dir, branch, remoteUrl, launcher, 
     if (code !== 0 && code !== 1) throw new Error(`git merge-base --is-ancestor ${a} ${b} failed (exit ${code})`);
     return code === 0;
   };
+  let ffBlocked = false;
   if (!fs.existsSync(path.join(dir, '.git'))) {
     if (fs.existsSync(dir) && fs.readdirSync(dir).length > 0) {
       throw new Error(`${dir} exists, is not a git checkout and is not empty`);
@@ -169,7 +173,8 @@ export async function checkout({ git, bundle, dir, branch, remoteUrl, launcher, 
     } else if (await isAncestor(head, tip)) {
       log(`checkout: fast-forwarding ${h} -> ${t}`);
       if ((await runLogged(log, git, ['merge', '--ff-only', tip], { cwd: dir, env })) !== 0) {
-        log(`checkout: NOT fast-forwarded (local changes in the way); kept ${h}. In-app self-update will handle it.`);
+        log(`checkout: NOT fast-forwarded (local changes in the way); kept ${h}`);
+        ffBlocked = true;
       }
     } else if (await isAncestor(tip, head)) {
       log(`checkout: kept ${h}; it is ahead of the installer's commit ${t}`);
@@ -178,12 +183,13 @@ export async function checkout({ git, bundle, dir, branch, remoteUrl, launcher, 
         + `Setup does not reset it, since it may hold your own commits. ${RECOVER}`);
     }
   }
-  await g(['config', 'core.autocrlf', 'false']);
-  await g(['remote', 'set-url', 'origin', remoteUrl]);
   if (!fs.existsSync(path.join(dir, ...launcher.split(/[\\/]/)))) {
     const head = (await gitOut(git, dir, ['rev-parse', '--short=8', 'HEAD'])).stdout;
     throw new Error(`${dir} is at ${head}, which has no ${launcher}, so code-conductor could not be started from it. ${RECOVER}`);
   }
+  await g(['config', 'core.autocrlf', 'false']);
+  await g(['remote', 'set-url', 'origin', remoteUrl]);
+  if (ffBlocked) log('checkout: in-app self-update will fast-forward it once the local changes are resolved');
 }
 
 export async function main(argv, env = process.env) {
@@ -218,8 +224,8 @@ export async function main(argv, env = process.env) {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main(process.argv.slice(2)).catch((e) => {
-    console.error(`setup failed: ${e.message}`);
-    try { fs.appendFileSync(path.join(process.argv[process.argv.indexOf('--install-dir') + 1], 'logs', 'setup.log'), `setup failed: ${e.stack}\n`); } catch {}
+    console.error(stamp(`setup failed: ${e.message}`));
+    try { fs.appendFileSync(path.join(process.argv[process.argv.indexOf('--install-dir') + 1], 'logs', 'setup.log'), `${stamp(`setup failed: ${e.stack}`)}\n`); } catch {}
     process.exit(1);
   });
 }

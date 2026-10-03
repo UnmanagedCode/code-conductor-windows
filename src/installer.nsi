@@ -7,6 +7,7 @@ Unicode true
 !include "LogicLib.nsh"
 !include "WinMessages.nsh"
 !include "FileFunc.nsh"
+!include "TextFunc.nsh"
 
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\code-conductor"
 
@@ -64,6 +65,7 @@ FunctionEnd
       nsExec::ExecToStack '"$INSTDIR\node\node.exe" "$INSTDIR\app\${LAUNCHER}" --status'
       Pop $0
       Pop $1
+      ${TrimNewLines} "$1" $1
       !insertmacro SetupLog "installer: launcher --status exited $0: $1"
       ${If} $0 == 0
         MessageBox MB_YESNO|MB_ICONQUESTION "code-conductor is running and must be stopped first. Stop it now?" /SD IDYES IDYES ${PREFIX}stop
@@ -73,6 +75,7 @@ FunctionEnd
         nsExec::ExecToStack '"$INSTDIR\node\node.exe" "$INSTDIR\app\${LAUNCHER}" --stop'
         Pop $0
         Pop $1
+        ${TrimNewLines} "$1" $1
         !insertmacro SetupLog "installer: launcher --stop exited $0: $1"
         ${If} $0 != 0
           Abort "Could not stop the running code-conductor. See $INSTDIR\logs\setup.log"

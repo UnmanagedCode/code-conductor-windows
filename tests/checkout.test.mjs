@@ -104,7 +104,8 @@ test('a dirty checkout that blocks the fast-forward is kept and the install cont
     await checkout({ ...args, bundle: t.bundle('b2.bundle') });
     assert.equal(git(dir, 'rev-parse', 'HEAD'), c1);
     assert.match(fs.readFileSync(path.join(dir, 'f.txt'), 'utf8'), /local edit/);
-    assert.ok(lines.some((l) => /NOT fast-forwarded/.test(l) && /self-update/.test(l)));
+    assert.ok(lines.some((l) => /NOT fast-forwarded/.test(l)));
+    assert.ok(lines.some((l) => /self-update will fast-forward it/.test(l)));
     assert.equal(git(dir, 'remote', 'get-url', 'origin'), t.origin);
   } finally { t.cleanup(); }
 });
@@ -192,4 +193,50 @@ test('a kept checkout without the launcher fails (ahead, or a blocked fast-forwa
     u.commit('moved'); // touches f.txt too, so the ff is blocked
     await assert.rejects(checkout({ ...args, bundle: u.bundle('new.bundle') }), /which has no bin\\windows-launch\.mjs/);
   } finally { u.cleanup(); }
+});
+
+test('a failing existing checkout keeps its git config: origin and autocrlf untouched', async () => {
+  const t = setup();
+  try {
+    const dir = path.join(t.root, 'app');
+    const args = { git: 'git', dir, branch: 'main', remoteUrl: t.origin, launcher: LAUNCHER, log: t.log, env: t.env };
+    const b1 = t.bundle('b1.bundle');
+    await checkout({ ...args, bundle: b1 });
+    execFileSync('git', ['-C', dir, 'config', 'core.autocrlf', 'input'], { env: t.env });
+    const config = () => [git(dir, 'remote', 'get-url', 'origin'), execFileSync('git', ['-C', dir, 'config', '--local', 'core.autocrlf'], { encoding: 'utf8', env: t.env }).trim()];
+    const before = config();
+    const other = { ...args, remoteUrl: 'https://example.invalid/other.git' };
+
+    // diverged
+    commitIn(t, dir, 'local work');
+    t.commit('c2');
+    await assert.rejects(checkout({ ...other, bundle: t.bundle('b2.bundle') }), /has diverged/);
+    assert.deepEqual(config(), before);
+
+    // kept (ahead of b1) without the launcher
+    execFileSync('git', ['-C', dir, 'rm', '-q', 'bin/windows-launch.mjs'], { env: t.env });
+    commitIn(t, dir, 'drop the launcher');
+    await assert.rejects(checkout({ ...other, bundle: b1 }), /which has no/);
+    assert.deepEqual(config(), before);
+  } finally { t.cleanup(); }
+});
+
+test('a blocked fast-forward that then fails the launcher check does not promise a self-update', async () => {
+  const t = setup();
+  try {
+    git(t.seed, 'rm', '-q', 'bin/windows-launch.mjs');
+    t.commit('pre-move');
+    const dir = path.join(t.root, 'app');
+    const lines = [];
+    const args = { git: 'git', dir, branch: 'main', remoteUrl: t.origin, launcher: LAUNCHER, log: (m) => lines.push(m), env: t.env };
+    await assert.rejects(checkout({ ...args, bundle: t.bundle('old.bundle') }), /which has no/);
+    fs.appendFileSync(path.join(dir, 'f.txt'), 'local edit\n');
+    fs.mkdirSync(path.join(t.seed, 'bin'), { recursive: true });
+    fs.writeFileSync(path.join(t.seed, 'bin', 'windows-launch.mjs'), '// launcher\n');
+    t.commit('moved'); // touches f.txt too, so the ff is blocked
+    lines.length = 0;
+    await assert.rejects(checkout({ ...args, bundle: t.bundle('new.bundle') }), /which has no/);
+    assert.ok(lines.some((l) => /NOT fast-forwarded/.test(l)), lines.join('\n'));
+    assert.equal(lines.some((l) => /self-update/.test(l)), false, lines.join('\n'));
+  } finally { t.cleanup(); }
 });

@@ -23,7 +23,7 @@ Run `code-conductor-setup-<version>-<commit>.exe` as the user who will use cc. T
      | ahead | kept |
      | diverged (neither contains the other) | **setup fails**, naming both commits |
 
-     A kept checkout must contain the launcher (`bin\windows-launch.mjs`), or setup fails. To recover from either failure, uninstall, then run the installer again; your projects root is kept.
+     A kept checkout must contain the launcher (`bin\windows-launch.mjs`), or setup fails. A failing checkout keeps its git config: `origin` and `core.autocrlf` are set only after these checks pass. To recover from either failure, uninstall, then run the installer again; your projects root is kept.
    - **Dependencies:** `npm ci` in `app\` with the bundled Node and npm.
 4. Only if setup succeeded: writes `code-conductor.exe` (the Start-menu stub), `uninstall.exe`, the Start-menu shortcut and the Apps & features entry (`DisplayVersion` `<version>+<commit>`), and shows the finish page. A failed setup aborts the installer (exit code 2 when silent) and points at `logs\setup.log`.
 
