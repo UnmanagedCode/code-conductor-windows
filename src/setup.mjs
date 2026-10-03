@@ -1,5 +1,5 @@
 // Install-time CLI, run by the installer with the bundled node:
-//   node setup.mjs --install-dir D --bundle B --branch X --remote URL
+//   node setup.mjs --install-dir D --bundle B --branch X --remote URL --launcher P
 // Ensures Git for Windows and claude, puts claude's dir on the user PATH,
 // creates/fast-forwards the git checkout at <D>\app, and runs `npm ci`.
 // Progress goes to stdout (the installer's details pane) and logs\setup.log.
@@ -134,11 +134,22 @@ const gitOut = (git, cwd, args) => new Promise((resolve) => {
   c.on('close', (code) => resolve({ code: code ?? -1, stdout: stdout.trim() }));
 });
 
+const RECOVER = 'To recover, uninstall code-conductor (Apps & features), then run this installer again; your projects in the projects root are kept.';
+
 // Fresh install: clone from the bundle (LF, branch + upstream set), then
-// point origin at the real remote. Existing checkout: fast-forward to the
-// bundle's tip, never downgrade or clobber.
-export async function checkout({ git, bundle, dir, branch, remoteUrl, log, env }) {
+// point origin at the real remote. Existing checkout, against the bundle's
+// tip: equal or ahead -> kept; behind -> fast-forwarded (kept if local
+// changes block it); diverged -> refused. Never reset: the checkout may hold
+// self-updated or local commits. Whatever is kept must have `launcher` (the
+// Start-menu entry's path in the checkout), else setup fails.
+export async function checkout({ git, bundle, dir, branch, remoteUrl, launcher, log, env }) {
   const g = (args, cwd = dir) => mustRun(log, git, args, { cwd, env });
+  // merge-base --is-ancestor: 0 yes, 1 no, anything else an error.
+  const isAncestor = async (a, b) => {
+    const code = await runLogged(log, git, ['merge-base', '--is-ancestor', a, b], { cwd: dir, env });
+    if (code !== 0 && code !== 1) throw new Error(`git merge-base --is-ancestor ${a} ${b} failed (exit ${code})`);
+    return code === 0;
+  };
   if (!fs.existsSync(path.join(dir, '.git'))) {
     if (fs.existsSync(dir) && fs.readdirSync(dir).length > 0) {
       throw new Error(`${dir} exists, is not a git checkout and is not empty`);
@@ -151,25 +162,34 @@ export async function checkout({ git, bundle, dir, branch, remoteUrl, log, env }
     await g(['fetch', bundle, branch]);
     const same = await gitOut(git, dir, ['rev-parse', 'HEAD', 'FETCH_HEAD']);
     const [head, tip] = same.stdout.split('\n');
+    if (same.code !== 0 || !head || !tip) throw new Error(`git rev-parse HEAD FETCH_HEAD failed in ${dir} (exit ${same.code})`);
+    const [h, t] = [head.slice(0, 8), tip.slice(0, 8)];
     if (head === tip) {
       log('checkout: already at the installer\'s commit');
-    } else if ((await runLogged(log, git, ['merge-base', '--is-ancestor', 'HEAD', 'FETCH_HEAD'], { cwd: dir, env })) === 0) {
-      log(`checkout: fast-forwarding ${head.slice(0, 8)} -> ${tip.slice(0, 8)}`);
-      if ((await runLogged(log, git, ['merge', '--ff-only', 'FETCH_HEAD'], { cwd: dir, env })) !== 0) {
-        log(`checkout: NOT fast-forwarded (local changes in the way); kept ${head.slice(0, 8)}. In-app self-update will handle it.`);
+    } else if (await isAncestor(head, tip)) {
+      log(`checkout: fast-forwarding ${h} -> ${t}`);
+      if ((await runLogged(log, git, ['merge', '--ff-only', tip], { cwd: dir, env })) !== 0) {
+        log(`checkout: NOT fast-forwarded (local changes in the way); kept ${h}. In-app self-update will handle it.`);
       }
+    } else if (await isAncestor(tip, head)) {
+      log(`checkout: kept ${h}; it is ahead of the installer's commit ${t}`);
     } else {
-      log(`checkout: kept ${head.slice(0, 8)}; it is at or ahead of the installer's commit ${tip.slice(0, 8)}`);
+      throw new Error(`${dir} is at ${h}, which has diverged from this installer's commit ${t} (neither contains the other). `
+        + `Setup does not reset it, since it may hold your own commits. ${RECOVER}`);
     }
   }
   await g(['config', 'core.autocrlf', 'false']);
   await g(['remote', 'set-url', 'origin', remoteUrl]);
+  if (!fs.existsSync(path.join(dir, ...launcher.split(/[\\/]/)))) {
+    const head = (await gitOut(git, dir, ['rev-parse', '--short=8', 'HEAD'])).stdout;
+    throw new Error(`${dir} is at ${head}, which has no ${launcher}, so code-conductor could not be started from it. ${RECOVER}`);
+  }
 }
 
 export async function main(argv, env = process.env) {
   const args = {};
   for (let i = 0; i < argv.length; i += 2) args[argv[i].replace(/^--/, '')] = argv[i + 1];
-  for (const k of ['install-dir', 'bundle', 'branch', 'remote']) {
+  for (const k of ['install-dir', 'bundle', 'branch', 'remote', 'launcher']) {
     if (!args[k]) throw new Error(`missing --${k}`);
   }
   const installDir = args['install-dir'];
@@ -188,7 +208,7 @@ export async function main(argv, env = process.env) {
   // Bundled node first, so `npm ci` and its children use the bundled npm.
   const pathKey = envKey(env, 'PATH') || 'Path';
   const toolEnv = { ...env, [pathKey]: [w.join(installDir, 'node'), git.cmdDir, ...splitPath(getEnv(env, 'PATH'))].join(';') };
-  await checkout({ git: git.gitExe, bundle: args.bundle, dir: appDir, branch: args.branch, remoteUrl: args.remote, log, env: toolEnv });
+  await checkout({ git: git.gitExe, bundle: args.bundle, dir: appDir, branch: args.branch, remoteUrl: args.remote, launcher: args.launcher, log, env: toolEnv });
 
   log('npm: npm ci');
   const npmCli = path.join(installDir, 'node', 'node_modules', 'npm', 'bin', 'npm-cli.js');

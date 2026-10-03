@@ -8,15 +8,24 @@ What this installer relies on from cc (launcher path and exit codes, install lay
 
 Run `code-conductor-setup-<version>-<commit>.exe` as the user who will use cc. The installer:
 
-1. Stops a running cc first, after asking (through the launcher's `--status`/`--stop`). It aborts if something answers on cc's port but can't be identified.
+1. Stops a running cc first, after asking (through the launcher's `--status`/`--stop`, whose results also go to `logs\setup.log`). It aborts if something answers on cc's port but can't be identified. If the existing `app\` has no launcher and something answers `/api/health`, it aborts rather than removing `node\` under a running server.
 2. Replaces `node\` with the bundled Node.
 3. Runs `setup.mjs` with that Node. Progress goes to the details pane and `logs\setup.log`:
    - **Git for Windows:** uses an existing Git that has Git Bash (`git.exe` in `<root>\cmd` or `<root>\bin`, plus `<root>\bin\bash.exe`), found on PATH, in `%LOCALAPPDATA%\Programs\Git` or in `%ProgramFiles%\Git`. A `git.exe` in `usr\bin`, `mingw64\bin` or `mingw32\bin` (Git's "optional Unix tools" PATH option) does not count. Setup uses the install's own `cmd\git.exe` (else `bin\git.exe`). Otherwise it downloads the pinned Git installer, checks its sha256 and installs it per-user (`/CURRENTUSER`, Git's `cmd` on PATH).
    - **Claude Code:** uses `claude.exe` on PATH (an npm `.cmd` shim does not count) or `%USERPROFILE%\.local\bin\claude.exe`. Otherwise it runs the official installer (`irm https://claude.ai/install.ps1 | iex`).
    - **User PATH:** appends `%USERPROFILE%\.local\bin` to the user `Path` (`HKCU\Environment`) if it is absent, keeping the existing entries, any `%VAR%` in them, non-ASCII characters and the value's kind (a new value is `REG_EXPAND_SZ`). It reads and writes through PowerShell's .NET registry API, not `reg.exe`, whose output is in the console code page. A Path it cannot read, or of a kind other than `REG_SZ`/`REG_EXPAND_SZ`, aborts setup rather than being overwritten.
-   - **Checkout:** a fresh install clones the bundled cc into `app\` (LF line endings, `core.autocrlf=false`, branch with upstream) and points `origin` at GitHub. An existing checkout is fast-forwarded to the bundled commit, and never downgraded or clobbered: if local changes block the fast-forward, it is kept and self-update handles it later.
+   - **Checkout:** a fresh install clones the bundled cc into `app\` (LF line endings, `core.autocrlf=false`, branch with upstream) and points `origin` at GitHub. An existing checkout is compared with the bundled commit and never reset, since it may hold self-updated or local commits:
+
+     | Existing `HEAD` | Result |
+     |---|---|
+     | equal | kept |
+     | behind | fast-forwarded; kept if local changes block it (self-update handles it later) |
+     | ahead | kept |
+     | diverged (neither contains the other) | **setup fails**, naming both commits |
+
+     A kept checkout must contain the launcher (`bin\windows-launch.mjs`), or setup fails. To recover from either failure, uninstall, then run the installer again; your projects root is kept.
    - **Dependencies:** `npm ci` in `app\` with the bundled Node and npm.
-4. Writes `code-conductor.exe` (the Start-menu stub), `uninstall.exe`, the Start-menu shortcut and the Apps & features entry.
+4. Only if setup succeeded: writes `code-conductor.exe` (the Start-menu stub), `uninstall.exe`, the Start-menu shortcut and the Apps & features entry (`DisplayVersion` `<version>+<commit>`), and shows the finish page. A failed setup aborts the installer (exit code 2 when silent) and points at `logs\setup.log`.
 
 The finish page offers to launch cc. Sign in to Claude once with `claude auth login` in a terminal if you haven't already. Your projects live in `%USERPROFILE%\code-conductor` unless `PROJECTS_ROOT` is set.
 
@@ -38,7 +47,7 @@ The finish page offers to launch cc. Sign in to Claude once with `claude auth lo
 ### Update
 
 - **cc:** the in-app self-update runs `git pull --ff-only` + `npm install` in `app\` and restarts.
-- **Re-running an installer** (newer or the same) stops cc, replaces `node\`, and fast-forwards `app\` to its bundled commit. An older installer keeps `app\` at its newer `HEAD`.
+- **Re-running an installer** (newer or the same) stops cc, replaces `node\`, and fast-forwards `app\` to its bundled commit. An older installer keeps `app\` at its newer `HEAD`; a diverged `app\` fails the install (see Checkout above).
 
 ### Node is never updated by self-update
 
@@ -135,7 +144,7 @@ $env:PWSH = 'powershell.exe'; node --test tests/userpath.pwsh.test.mjs   # in a 
 |---|---|
 | `tests/build.test.mjs` | `buildInstaller` against a synthetic cc-shaped repo with a fake `makensis`: ref resolution (branch/tag/sha), contract refusals, the off-branch warning, the stage contents and defines, the pinned-zip cache |
 | `tests/build.real.test.mjs` | Gated by `RUN_WIN_INSTALLER_BUILD=1`: a real fetch, the pinned Node download and real `makensis` produce a PE exe over 20 MB. `CC_SOURCE`/`CC_REF` override the GitHub default and `main` |
-| `tests/checkout.test.mjs` | `checkout()` with real git: fresh clone (LF, upstream, origin), fast-forward, never downgrade, a dirty tree kept |
+| `tests/checkout.test.mjs` | `checkout()` with real git: fresh clone (LF, upstream, origin); equal/behind/ahead/diverged classification; a dirty tree kept; a kept checkout without the launcher refused |
 | `tests/setup.test.mjs` | `ensureGit` sha refusal, `downloadWithRetry` |
 | `tests/toolchain.test.mjs` | `detectGit` layouts (mirroring cc's C8, plus the rejected `usr\bin`/`mingw64\bin`), `detectClaude`, `findOnPath`, `addToUserPath` against a fake of the PowerShell channel (base64 JSON both ways, exit 1 with localized stderr, non-ASCII round-trip) |
 | `tests/userpath.pwsh.test.mjs` | Gated by `PWSH`: the real user-Path scripts run by real PowerShell through `runPowerShell`, with `HKCU\Environment` swapped for a fake key, so the encoding path is exercised end to end (non-ASCII round-trip, a multi-KB Path past the command-line limit, kinds, failure exit codes) |
