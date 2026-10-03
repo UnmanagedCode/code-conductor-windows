@@ -283,13 +283,16 @@ export async function checkout({ git, source, dir, branch, nodeVersion, log, env
           log(`checkout: branch ${backup} already exists at another commit; kept ${h}`);
           throw diverged(h, t);
         }
-        if (have.code !== 0 && (await runLogged(log, git, ['branch', backup, headSha], { cwd: dir, env })) !== 0) {
+        const created = have.code !== 0;
+        if (created && (await runLogged(log, git, ['branch', backup, headSha], { cwd: dir, env })) !== 0) {
           log(`checkout: could not create branch ${backup}; kept ${h}`);
           throw diverged(h, t);
         }
         log(`checkout: moving ${h} -> ${t}: it has diverged from the latest ${branch}, but each of its commits has a patch-equivalent in its history; the old ${h} is kept as branch ${backup}`);
         if ((await runLogged(log, git, ['reset', '--keep', tip], { cwd: dir, env })) !== 0) {
           log(`checkout: NOT moved (untracked files in the way); kept ${h}`);
+          // nothing moved, so a backup made by this run has no purpose
+          if (created) await gitOut(git, dir, ['branch', '-D', backup], { env });
           throw diverged(h, t);
         }
       }

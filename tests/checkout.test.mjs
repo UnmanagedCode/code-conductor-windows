@@ -433,6 +433,8 @@ test('an untracked file in the tip\'s way blocks the move', async () => {
     assert.equal(fs.readFileSync(path.join(t.dir, 'new.txt'), 'utf8'), 'precious\n');
     assert.equal(git(t.dir, 'rev-parse', 'HEAD'), head);
     assert.match(t.lines.join('\n'), /NOT moved/);
+    // Invariant: a refused move leaves no backup branch this run made.
+    assert.equal(git(t.dir, 'branch', '--list', 'pre-install/*'), '');
   } finally { t.cleanup(); }
 });
 
@@ -522,6 +524,36 @@ test('a git failure while judging recoverability gives the diverged error', asyn
     t.lines.length = 0;
     await assert.rejects(checkout({ ...real, git: wrapper }), /has diverged/);
     assert.match(t.lines.join('\n'), /git cherry failed \(exit 3\)/);
+    assert.equal(git(t.dir, 'rev-parse', 'HEAD'), head);
+  } finally { t.cleanup(); }
+});
+
+// Invariant: a pre-existing pre-install/<sha8> at the old HEAD is reused, not
+// an obstacle, and the move succeeds; the branch stays.
+test('an existing pre-install branch at the same commit is reused', async () => {
+  const t = setup();
+  try {
+    await checkout(t.args());
+    const { head, tip } = rebased(t);
+    git(t.dir, 'branch', `pre-install/${head.slice(0, 8)}`, head);
+    await checkout(t.args());
+    assert.equal(git(t.dir, 'rev-parse', 'HEAD'), tip);
+    assert.equal(git(t.dir, 'rev-parse', `pre-install/${head.slice(0, 8)}`), head);
+  } finally { t.cleanup(); }
+});
+
+// Invariant: the backup is made before the move: when it cannot be created (a
+// branch named `pre-install` blocks the pre-install/ namespace), setup fails
+// as diverged with HEAD where it was.
+test('a backup branch that cannot be created stops the move before it happens', async () => {
+  const t = setup();
+  try {
+    await checkout(t.args());
+    const { head } = rebased(t);
+    git(t.dir, 'branch', 'pre-install', head);
+    t.lines.length = 0;
+    await assert.rejects(checkout(t.args()), /has diverged/);
+    assert.match(t.lines.join('\n'), /could not create branch pre-install\//);
     assert.equal(git(t.dir, 'rev-parse', 'HEAD'), head);
   } finally { t.cleanup(); }
 });
