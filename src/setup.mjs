@@ -140,6 +140,39 @@ const gitOut = (git, cwd, args, { raw = false, env } = {}) => new Promise((resol
   c.on('close', (code) => resolve({ code: code ?? -1, stdout: raw ? stdout : stdout.trim() }));
 });
 
+// Why `HEAD` cannot be moved to `tip` when it has diverged, or null when it
+// can: HEAD is on `branch` or detached (the move never rewrites another
+// branch), every non-merge commit off the tip has a patch-equivalent (same
+// patch-id, git cherry) in the tip's history, every off-tip merge re-merges
+// its parents automatically to its own tree (cherry skips merges, so a
+// hand-resolved one would hide work), and the tracked tree is clean. A
+// patch-equivalent does not prove the content is still in the tip's tree
+// (upstream may have reverted it), so the caller keeps the old HEAD as a branch.
+async function offTip(git, dir, tip, branch, env) {
+  const short = (sha) => sha.slice(0, 8);
+  const cur = await gitOut(git, dir, ['symbolic-ref', '-q', '--short', 'HEAD'], { env });
+  if (cur.code === 0 && cur.stdout !== branch) return `on branch ${cur.stdout}, not ${branch}`;
+  if (cur.code > 1) return `git symbolic-ref failed (exit ${cur.code})`;
+  const cherry = await gitOut(git, dir, ['cherry', tip, 'HEAD'], { env });
+  if (cherry.code !== 0) return `git cherry failed (exit ${cherry.code})`;
+  const unique = cherry.stdout.split('\n').filter((l) => l.startsWith('+')).map((l) => short(l.slice(2).trim()));
+  if (unique.length) return `commits not on it: ${unique.join(', ')}`;
+  const merges = await gitOut(git, dir, ['rev-list', '--merges', '--parents', `${tip}..HEAD`], { env });
+  if (merges.code !== 0) return `git rev-list failed (exit ${merges.code})`;
+  for (const line of merges.stdout.split('\n').filter(Boolean)) {
+    const [m, ...parents] = line.split(' ');
+    if (parents.length !== 2) return `merge ${short(m)} has more than two parents`;
+    const tree = await gitOut(git, dir, ['merge-tree', '--write-tree', ...parents], { env });
+    if (tree.code === 1) return `merge ${short(m)} has changes of its own`;
+    if (tree.code !== 0) return `git merge-tree --write-tree failed (exit ${tree.code}; needs Git 2.38 or later)`;
+    const own = await gitOut(git, dir, ['rev-parse', `${m}^{tree}`], { env });
+    if (own.code !== 0 || tree.stdout.split('\n')[0] !== own.stdout) return `merge ${short(m)} has changes of its own`;
+  }
+  const dirty = await gitOut(git, dir, ['status', '--porcelain', '--untracked-files=no'], { env });
+  if (dirty.code !== 0 || dirty.stdout) return 'uncommitted changes';
+  return null;
+}
+
 // `read(rel)` for contractProblems: the file's text at `rev`, null if absent.
 const showAt = (git, dir, rev, env) => async (rel) => {
   const r = await gitOut(git, dir, ['show', `${rev}:${rel}`], { raw: true, env });
@@ -171,7 +204,11 @@ async function retryGit(log, git, args, { cwd, env, sleep, attempts = 3, source,
 // fetched tip: equal or ahead -> kept; behind -> fast-forwarded (kept if
 // local changes block it, or if the tip fails the contract, so a re-run for
 // Node/Git/claude works while the newest cc is uninstallable); diverged ->
-// refused. Never reset: the checkout may hold self-updated or local commits.
+// moved to the tip (`reset --keep`, same tip-contract rule) when HEAD is on
+// `branch` or detached, every off-tip commit has a patch-equivalent in the
+// tip's history (git cherry), every off-tip merge is an automatic one and the
+// tracked tree is clean; the old HEAD is first kept as pre-install/<sha8>.
+// Refused otherwise, since it may hold the user's own work.
 // Whatever HEAD ends up at must meet the contract, else setup fails. Git
 // config (autocrlf, origin) is touched only once every check has passed.
 // Returns {commit, version} of HEAD.
@@ -187,6 +224,8 @@ export async function checkout({ git, source, dir, branch, nodeVersion, log, env
   };
   const head = async (...flags) => (await gitOut(git, dir, ['rev-parse', ...flags, 'HEAD'], { env })).stdout;
   const fail = (rev, problems) => `${rev}, which does not meet the installer contract:${contractError(problems)}\n`;
+  const diverged = (h, t) => new Error(`${dir} is at ${h}, which has diverged from the latest ${branch} ${t} (neither contains the other). `
+    + `Setup does not reset it, since it may hold your own commits. ${RECOVER}`);
   let ffBlocked = false;
   if (!fs.existsSync(path.join(dir, '.git'))) {
     if (fs.existsSync(dir) && fs.readdirSync(dir).length > 0) {
@@ -210,14 +249,19 @@ export async function checkout({ git, source, dir, branch, nodeVersion, log, env
     const [headSha, tip] = same.stdout.split('\n');
     if (same.code !== 0 || !headSha || !tip) throw new Error(`git rev-parse HEAD FETCH_HEAD failed in ${dir} (exit ${same.code})`);
     const [h, t] = [headSha.slice(0, 8), tip.slice(0, 8)];
-    if (headSha === tip) {
-      log(`checkout: already at the latest ${branch}`);
-    } else if (await isAncestor(headSha, tip)) {
+    // false (logged) when the tip fails the contract, so HEAD stays.
+    const tipPasses = async () => {
       const { problems } = await contractProblems(showAt(git, dir, tip, env), nodeVersion);
       if (problems.length) {
         log(`checkout: the latest ${branch} ${t} does not meet the installer contract; kept ${h}:`);
         for (const p of problems) log(`  - ${p}`);
-      } else {
+      }
+      return problems.length === 0;
+    };
+    if (headSha === tip) {
+      log(`checkout: already at the latest ${branch}`);
+    } else if (await isAncestor(headSha, tip)) {
+      if (await tipPasses()) {
         log(`checkout: fast-forwarding ${h} -> ${t}`);
         if ((await runLogged(log, git, ['merge', '--ff-only', tip], { cwd: dir, env })) !== 0) {
           log(`checkout: NOT fast-forwarded (local changes in the way); kept ${h}`);
@@ -227,8 +271,31 @@ export async function checkout({ git, source, dir, branch, nodeVersion, log, env
     } else if (await isAncestor(tip, headSha)) {
       log(`checkout: kept ${h}; it is ahead of the latest ${branch} ${t}`);
     } else {
-      throw new Error(`${dir} is at ${h}, which has diverged from the latest ${branch} ${t} (neither contains the other). `
-        + `Setup does not reset it, since it may hold your own commits. ${RECOVER}`);
+      const why = await offTip(git, dir, tip, branch, env);
+      if (why) {
+        log(`checkout: ${h} cannot be moved to the latest ${branch} ${t}: ${why}`);
+        throw diverged(h, t);
+      }
+      if (await tipPasses()) {
+        const backup = `pre-install/${h}`;
+        const have = await gitOut(git, dir, ['rev-parse', '-q', '--verify', `refs/heads/${backup}`], { env });
+        if (have.code === 0 && have.stdout !== headSha) {
+          log(`checkout: branch ${backup} already exists at another commit; kept ${h}`);
+          throw diverged(h, t);
+        }
+        const created = have.code !== 0;
+        if (created && (await runLogged(log, git, ['branch', backup, headSha], { cwd: dir, env })) !== 0) {
+          log(`checkout: could not create branch ${backup}; kept ${h}`);
+          throw diverged(h, t);
+        }
+        log(`checkout: moving ${h} -> ${t}: it has diverged from the latest ${branch}, but each of its commits has a patch-equivalent in its history; the old ${h} is kept as branch ${backup}`);
+        if ((await runLogged(log, git, ['reset', '--keep', tip], { cwd: dir, env })) !== 0) {
+          log(`checkout: NOT moved (untracked files in the way); kept ${h}`);
+          // nothing moved, so a backup made by this run has no purpose
+          if (created) await gitOut(git, dir, ['branch', '-D', backup], { env });
+          throw diverged(h, t);
+        }
+      }
     }
   }
   const { problems, version } = await contractProblems(showAt(git, dir, 'HEAD', env), nodeVersion);

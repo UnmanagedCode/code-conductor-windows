@@ -1,6 +1,6 @@
 # code-conductor-windows
 
-The per-user Windows installer for [code-conductor](https://github.com/UnmanagedCode/code-conductor) (cc). It is a single `code-conductor-setup-<version>.exe` that installs the latest cc `main` from GitHub at install time, for the current Windows user, with no admin rights. That covers a bundled Node, a git checkout that cc's in-app self-update keeps current, Git for Windows and Claude Code (if missing), a projects folder of your choice and a Start-menu entry. The exe is built on Linux and is not tied to a cc commit.
+The per-user Windows installer for [code-conductor](https://github.com/UnmanagedCode/code-conductor) (cc). It is a single `code-conductor-setup-<version>.exe` that installs the latest cc `main` from GitHub at install time, for the current Windows user, with no admin rights. That covers a bundled Node, a git checkout that cc's in-app self-update keeps current, Git for Windows and Claude Code (if missing), a projects folder of your choice and a Start-menu entry and a desktop shortcut. The exe is built on Linux and is not tied to a cc commit.
 
 What this installer relies on from cc (launcher path and exit codes, install layout, checkout recipe, tool locations, projects root) is cc's **installer contract**: [▶ cc docs/windows.md#installer-contract](https://github.com/UnmanagedCode/code-conductor/blob/main/docs/windows.md#installer-contract). This README does not restate it.
 
@@ -10,20 +10,21 @@ Run `code-conductor-setup-<version>.exe` as the user who will use cc. It needs n
 
 1. Stops a running cc first, after asking (through the launcher's `--status`/`--stop`, whose results also go to `logs\setup.log`). It aborts if something answers on cc's port but can't be identified. If the existing `app\` has no launcher and something answers `/api/health`, it aborts rather than removing `node\` under a running server.
 2. Replaces `node\` with the bundled Node.
-3. Asks for the **projects folder** (a directory page). The default is the existing user `PROJECTS_ROOT`, else an inherited `PROJECTS_ROOT`, else `%USERPROFILE%\code-conductor`. Silent installs take `/PROJECTS=<dir>`, which wins over all of those. Accepted forms: `/S /PROJECTS="D:\My projects"`, a whole-token quote as PowerShell passes it (`"/PROJECTS=D:\My projects"`), and an unquoted path without spaces, where `/` works as `\` (`/PROJECTS=D:/x`). A `/PROJECTS=` with no folder aborts the installer instead of falling back to another folder. A drive root (`D:\`) is accepted.
+3. Asks for the **projects folder** (a directory page). The default is the existing user `PROJECTS_ROOT`, else an inherited `PROJECTS_ROOT`, else `%USERPROFILE%\code-conductor`. Silent installs take `/PROJECTS=<dir>`, which wins over all of those. Accepted forms: `/S /PROJECTS="D:\My projects"`, a whole-token quote as PowerShell passes it (`"/PROJECTS=D:\My projects"`), and an unquoted path without spaces, where `/` works as `\` (`/PROJECTS=D:/x`). A `/PROJECTS=` with no folder aborts the installer instead of falling back to another folder. A drive root (`D:\`) is accepted. `/NODESKTOP` skips the desktop shortcut and, on a re-install, removes an existing one; it is accepted as `/NODESKTOP` or `"/NODESKTOP"`, as a whole token in any case. Without it a silent install creates the shortcut.
 4. Runs `setup.mjs` with that Node. Progress goes to the details pane and `logs\setup.log`:
    - **Projects folder (validated first, before any download):** it must be an absolute path (drive letter or UNC) that is not the install directory or inside it (uninstall deletes that), and not an existing file.
    - **Git for Windows:** uses an existing Git that has Git Bash (`git.exe` in `<root>\cmd` or `<root>\bin`, plus `<root>\bin\bash.exe`), found on PATH, in `%LOCALAPPDATA%\Programs\Git` or in `%ProgramFiles%\Git`. A `git.exe` in `usr\bin`, `mingw64\bin` or `mingw32\bin` (Git's "optional Unix tools" PATH option) does not count. Setup uses the install's own `cmd\git.exe` (else `bin\git.exe`). Otherwise it downloads the pinned Git installer, checks its sha256 and installs it per-user (`/CURRENTUSER`, Git's `cmd` on PATH).
    - **Claude Code:** uses `claude.exe` on PATH (an npm `.cmd` shim does not count) or `%USERPROFILE%\.local\bin\claude.exe`. Otherwise it runs the official installer (`irm https://claude.ai/install.ps1 | iex`).
    - **User PATH:** appends `%USERPROFILE%\.local\bin` to the user `Path` (`HKCU\Environment`) if it is absent, keeping the existing entries, any `%VAR%` in them, non-ASCII characters and the value's kind (a new value is `REG_EXPAND_SZ`). It reads and writes through PowerShell's .NET registry API, not `reg.exe`, whose output is in the console code page. A Path it cannot read, or of a kind other than `REG_SZ`/`REG_EXPAND_SZ`, aborts setup rather than being overwritten.
-   - **Checkout:** a fresh install clones cc's latest `main` from GitHub into `app\` (LF line endings, `core.autocrlf=false`, branch with upstream, `origin` = the source). An existing checkout is fetched and compared with the latest `main`, and never reset, since it may hold self-updated or local commits. The clone or fetch is tried 3 times (2 s, then 4 s apart) with Git's credential prompts off, so a bad URL fails instead of hanging; a final failure aborts the install and points at `setup.log`.
+   - **Checkout:** a fresh install clones cc's latest `main` from GitHub into `app\` (LF line endings, `core.autocrlf=false`, branch with upstream, `origin` = the source). An existing checkout is fetched and compared with the latest `main` and moved only as the table says. The clone or fetch is tried 3 times (2 s, then 4 s apart) with Git's credential prompts off, so a bad URL fails instead of hanging; a final failure aborts the install and points at `setup.log`.
 
      | Existing `HEAD` | Result |
      |---|---|
      | equal to the latest `main` | kept |
      | behind | fast-forwarded; kept if local changes block it (self-update handles it later) |
      | ahead | kept |
-     | diverged (neither contains the other) | **setup fails**, naming both commits |
+     | diverged (neither contains the other), `HEAD` on the installed branch or detached, every off-tip commit has a patch-equivalent (same patch-id) in `main`'s history (`git cherry <tip> HEAD` has no `+`), every off-tip merge an automatic one (`git merge-tree --write-tree` of its parents gives its tree; needs Git ≥ 2.38), tracked tree clean | **moved to the latest `main`** with `git reset --keep`; the old `HEAD` is first saved as branch `pre-install/<sha8>` (an existing one at another commit stops the move); branch, upstream and non-ignored untracked files are kept (an ignored file at a path `main` tracks is overwritten, as in a fast-forward); logs `checkout: moving <old> -> <new>: …` naming that branch. A patch-equivalent does not prove the content is still in `main`'s tree (it may have been reverted there): the saved branch is where to find it |
+     | diverged otherwise (unique commits, a merge with its own changes, uncommitted changes, `HEAD` on another branch, a git failure while checking, or an untracked file in the tip's way) | **setup fails**, naming both commits; the reason is in `setup.log` |
 
      Setup checks the **installer contract** (see `src/contract.mjs`) with `git show` against the fetched tip and against the final `HEAD`:
      - `bin\windows-launch.mjs`, `package.json`, `package-lock.json` and `LICENSE` exist;
@@ -34,15 +35,15 @@ Run `code-conductor-setup-<version>.exe` as the user who will use cc. It needs n
      | Failing revision | Result |
      |---|---|
      | fresh install, latest `main` fails | **setup fails**, naming the problems; the partial `app\` is removed so a re-run starts clean |
-     | existing install, latest `main` fails | not applied; `HEAD` is kept with a warning in `setup.log`, and the install continues if `HEAD` passes |
+     | existing install, latest `main` fails (also when it would be the move target of a rebased-diverged checkout) | not applied; `HEAD` is kept with a warning in `setup.log`, and the install continues if `HEAD` passes |
      | the `HEAD` that results fails (any path) | **setup fails**, naming the problems |
 
-     A fresh install has nothing usable to fall back on. An existing one keeps working, and refusing it would also block a re-run to repair Node, Git or Claude Code. A failing checkout keeps its git config: `origin` and `core.autocrlf` are set only after these checks pass. To recover from a failed checkout, uninstall, then run the installer again; your projects folder is kept. The installed commit is logged: `checkout: installed cc <version> at <sha> (<branch> from <source>)`.
+     A fresh install has nothing usable to fall back on. An existing one keeps working, and refusing it would also block a re-run to repair Node, Git or Claude Code. A failing checkout keeps its git config: `origin` and `core.autocrlf` are set only after these checks pass. A diverged checkout that fails holds work of its own, and uninstalling removes `app\` with it: save that work first, e.g. `git -C "%LOCALAPPDATA%\Programs\code-conductor\app" format-patch <latest main>..HEAD`, or push it elsewhere. After a move the old commit lives only on the `pre-install/<sha8>` branch in `app\`, which uninstalling deletes: save it first, e.g. `git -C "%LOCALAPPDATA%\Programs\code-conductor\app" format-patch <latest main>..pre-install/<sha8>`, or push that branch somewhere. Then uninstall and run the installer again; your projects folder is kept. The installed commit is logged: `checkout: installed cc <version> at <sha> (<branch> from <source>)`.
    - **Dependencies:** `npm ci` in `app\` with the bundled Node and npm.
    - **Projects:** creates the folder and saves it as the user environment variable `PROJECTS_ROOT` (`HKCU\Environment`, which cc's launcher honours), through the same PowerShell channel as the Path. It writes only when the folder differs from what the launcher would already use (the user value, else an inherited one, else the default), so a default install leaves the registry alone and an existing `%VAR%` form is kept. A value of a kind other than `REG_SZ`/`REG_EXPAND_SZ` aborts setup rather than being overwritten.
-5. Only if setup succeeded: writes `code-conductor.exe` (the Start-menu stub), `uninstall.exe`, the Start-menu shortcut and the Apps & features entry (`DisplayVersion` = the installer's version), sets `PROJECTS_ROOT` in the installer's own environment so the finish page's Launch uses the chosen folder, and shows the finish page. A failed setup aborts the installer (exit code 2 when silent) and points at `logs\setup.log`.
+5. Only if setup succeeded: writes `code-conductor.exe` (the Start-menu stub), `uninstall.exe`, the Start-menu shortcut, the desktop shortcut (silent installs: unless `/NODESKTOP`) and the Apps & features entry (`DisplayVersion` = the installer's version), sets `PROJECTS_ROOT` in the installer's own environment so the finish page's Launch uses the chosen folder, and shows the finish page. A failed setup aborts the installer (exit code 2 when silent) and points at `logs\setup.log`.
 
-The finish page offers to launch cc. Sign in to Claude once with `claude auth login` in a terminal if you haven't already. Your projects live in the folder you chose.
+The finish page offers to launch cc and to create a desktop shortcut (ticked; unticked when `/NODESKTOP` was given). Unticking it on a re-install removes an existing desktop shortcut. Sign in to Claude once with `claude auth login` in a terminal if you haven't already. Your projects live in the folder you chose.
 
 ### Install layout
 
@@ -62,7 +63,7 @@ The finish page offers to launch cc. Sign in to Claude once with `claude auth lo
 ### Update
 
 - **cc:** the in-app self-update runs `git pull --ff-only` + `npm install` in `app\` and restarts.
-- **Re-running the installer** stops cc, replaces `node\`, and brings `app\` forward to the latest `main` under the Checkout rules above. A checkout ahead of `main` is kept; a diverged one fails the install.
+- **Re-running the installer** stops cc, replaces `node\`, and brings `app\` forward to the latest `main` under the Checkout rules above. A checkout ahead of `main` is kept; a diverged one is moved to `main`, its old `HEAD` kept as `pre-install/<sha8>`, when every commit has a patch-equivalent in `main`'s history (rebased), else it fails the install.
 
 ### Node is never updated by self-update
 
@@ -70,7 +71,7 @@ In-app self-update moves only `app\`. The bundled `node\` stays at the version t
 
 ### Uninstall
 
-Apps & features → code-conductor, or `uninstall.exe` (`/S` for silent). It stops a running cc, then removes the install directory, the Start-menu shortcut and the Apps & features entry. It **keeps** your projects folder (and its `.code-conductor` store), the user `PROJECTS_ROOT` variable naming it (so a re-install finds the same projects), Git for Windows, Claude Code and the user PATH entry.
+Apps & features → code-conductor, or `uninstall.exe` (`/S` for silent). It stops a running cc, then removes the install directory, the Start-menu and desktop shortcuts and the Apps & features entry. It **keeps** your projects folder (and its `.code-conductor` store), the user `PROJECTS_ROOT` variable naming it (so a re-install finds the same projects), Git for Windows, Claude Code and the user PATH entry.
 
 ### Limitations
 
@@ -138,7 +139,7 @@ sed -e 's/font-family="[^"]*"/font-family="DejaVu Sans Mono"/' -e 's/stroke="#ff
 convert -background none /tmp/cc-icon.svg -define icon:auto-resize=256,64,48,32,24,16 src/icon.ico
 ```
 
-The installer and uninstaller use it through `MUI_ICON`/`MUI_UNICON`, the stub through `Icon`, and the Start-menu shortcut names the stub as its icon.
+The installer and uninstaller use it through `MUI_ICON`/`MUI_UNICON`, the stub through `Icon`, and the Start-menu and desktop shortcuts name the stub as their icon.
 
 ### Pins
 
@@ -168,7 +169,7 @@ $env:PWSH = 'powershell.exe'; node --test tests/userpath.pwsh.test.mjs   # in a 
 | `tests/projects.test.mjs` | `checkProjectsRoot` (relative, inside the install dir, file, UNC, trailing `\`) and `persistProjectsRoot` against a fake of the PowerShell channel (unchanged → no write, kind kept, Binary refused, non-ASCII) |
 | `tests/build.test.mjs` | `buildInstaller` with a fake `makensis`: version-named exe, the defines (no commit), the stage contents (no bundled cc checkout), `--source`/`--branch`, refused quote/whitespace, the pinned-zip cache, `icon.ico` structure |
 | `tests/build.real.test.mjs` | Gated by `RUN_WIN_INSTALLER_BUILD=1`: the pinned Node download and real `makensis` produce a PE exe over 20 MB named by version only |
-| `tests/checkout.test.mjs` | `checkout()` with real git against a local origin: fresh clone (LF, upstream, origin, installed line); equal/behind/ahead/diverged; a dirty tree kept; contract failures (fresh removes `app\`, existing keeps `HEAD` and warns, a failing `HEAD` fails with config untouched); 3 attempts on an unreachable source; prompts disabled for clone/fetch |
+| `tests/checkout.test.mjs` | `checkout()` with real git against a local origin: fresh clone (LF, upstream, origin, installed line); equal/behind/ahead/diverged; a diverged checkout whose commits (merges included) have patch-equivalents on the tip is moved to it, keeping branch, upstream and untracked files and saving the old `HEAD` as `pre-install/<sha8>` (also when upstream reverted the patch); another branch or an existing backup at another commit, a failing git check, a genuine commit, a merge with its own changes, a dirty tree or an untracked file in the way still fails as diverged; a contract-failing tip keeps `HEAD`; a dirty tree kept; contract failures (fresh removes `app\`, existing keeps `HEAD` and warns, a failing `HEAD` fails with config untouched); 3 attempts on an unreachable source; prompts disabled for clone/fetch |
 | `tests/checkout.real.test.mjs` | Gated by `RUN_REAL_CC_FETCH=1`: a real `checkout()` of GitHub `main` with the pinned Node, proving current cc `main` passes the install-time contract |
 | `tests/setup.test.mjs` | `ensureGit` sha refusal, `downloadWithRetry` |
 | `tests/toolchain.test.mjs` | `detectGit` layouts (mirroring cc's C8, plus the rejected `usr\bin`/`mingw64\bin`), `detectClaude`, `findOnPath`, `addToUserPath`/`readUserEnv`/`writeUserEnv` against a fake of the PowerShell channel (base64 JSON both ways, addressed by value name, exit 1 with localized stderr, non-ASCII round-trip) |

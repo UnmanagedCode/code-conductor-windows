@@ -1,6 +1,7 @@
 ; Per-user installer + uninstaller. Built by build.mjs, which passes
 ; -DVERSION -DSOURCE -DBRANCH -DSTAGE -DOUTFILE -DLAUNCHER -DICON.
 ; /PROJECTS=<dir> sets the projects folder (also when silent).
+; /NODESKTOP skips the desktop shortcut and removes an existing one (also when silent).
 ; What it relies on from cc (launcher path and exit codes, layout):
 ; https://github.com/UnmanagedCode/code-conductor/blob/main/docs/windows.md#installer-contract
 Unicode true
@@ -25,6 +26,9 @@ ShowInstDetails show
 !define MUI_UNICON "${ICON}"
 !define MUI_FINISHPAGE_RUN "$INSTDIR\code-conductor.exe"
 !define MUI_FINISHPAGE_RUN_TEXT "Launch code-conductor"
+!define MUI_FINISHPAGE_SHOWREADME ""
+!define MUI_FINISHPAGE_SHOWREADME_TEXT "Create a desktop shortcut"
+!define MUI_FINISHPAGE_SHOWREADME_FUNCTION CreateDesktopShortcut
 !define MUI_FINISHPAGE_TEXT "code-conductor is installed. Your projects live in $ProjectsRoot.$\r$\n$\r$\nIf you have not signed in to Claude yet, run $\"claude auth login$\" once in a terminal."
 
 ; Set only once every install step succeeded; the finish page ("installed",
@@ -33,6 +37,8 @@ Var InstallOk
 ; The projects folder: /PROJECTS=, else the user PROJECTS_ROOT, else the
 ; default (the launcher's own, which an inherited PROJECTS_ROOT overrides).
 Var ProjectsRoot
+; 1 when /NODESKTOP was given.
+Var NoDesktop
 
 SpaceTexts none
 !insertmacro MUI_PAGE_LICENSE "${STAGE}\LICENSE"
@@ -43,6 +49,8 @@ SpaceTexts none
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !define MUI_PAGE_CUSTOMFUNCTION_PRE FinishPre
+!define MUI_PAGE_CUSTOMFUNCTION_SHOW FinishShow
+!define MUI_PAGE_CUSTOMFUNCTION_LEAVE FinishLeave
 !insertmacro MUI_PAGE_FINISH
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "English"
@@ -120,6 +128,38 @@ Function ParseProjectsSwitch
   ${WordReplace} "$ProjectsRoot" "/" "\" "+*" $ProjectsRoot
 FunctionEnd
 
+; Sets $NoDesktop to 1 when /NODESKTOP is a whole token of $CMDLINE. Tokens
+; split at spaces outside double quotes, quote characters are dropped and the
+; comparison ignores case. Matches: /NODESKTOP  "/NODESKTOP". Does not match:
+; /NODESKTOPX  /PROJECTS=D:/x/NODESKTOP  /PROJECTS="D:\a /NODESKTOP" (the
+; space is inside quotes, so that is one token).
+Function ParseNoDesktopSwitch
+  StrCpy $NoDesktop 0
+  ; $R0: the line plus a space that flushes the last token; $R1: position;
+  ; $R2: the current token; $R3: 1 inside quotes; $R4: the current character
+  StrCpy $R0 "$CMDLINE "
+  StrLen $R1 $R0
+  StrCpy $R2 ""
+  StrCpy $R3 0
+  ${While} $R1 > 0
+    StrLen $R4 $R0
+    IntOp $R4 $R4 - $R1
+    StrCpy $R4 $R0 1 $R4
+    IntOp $R1 $R1 - 1
+    ${If} $R4 == '"'
+      IntOp $R3 $R3 ! 
+    ${ElseIf} $R4 == " "
+    ${AndIf} $R3 == 0
+      ${If} $R2 == "/NODESKTOP"
+        StrCpy $NoDesktop 1
+      ${EndIf}
+      StrCpy $R2 ""
+    ${Else}
+      StrCpy $R2 "$R2$R4"
+    ${EndIf}
+  ${EndWhile}
+FunctionEnd
+
 Function .onInit
   Call ParseProjectsSwitch
   ${If} $R9 == 1
@@ -130,6 +170,28 @@ Function .onInit
     ${EndIf}
   ${Else}
     !insertmacro ResolveProjectsRoot
+  ${EndIf}
+  Call ParseNoDesktopSwitch
+FunctionEnd
+
+Function CreateDesktopShortcut
+  CreateShortcut "$DESKTOP\code-conductor.lnk" "$INSTDIR\code-conductor.exe" "" "$INSTDIR\code-conductor.exe" 0
+FunctionEnd
+
+; /NODESKTOP unticks the box; the user can still tick it.
+Function FinishShow
+  ${If} $NoDesktop == 1
+    SendMessage $mui.FinishPage.ShowReadme ${BM_SETCHECK} ${BST_UNCHECKED} 0
+  ${EndIf}
+FunctionEnd
+
+; Runs before MUI handles the checkboxes, while the handle is still valid:
+; an unticked box removes an existing shortcut (a ticked one is written by
+; CreateDesktopShortcut after this).
+Function FinishLeave
+  SendMessage $mui.FinishPage.ShowReadme ${BM_GETCHECK} 0 0 $0
+  ${If} $0 != ${BST_CHECKED}
+    Delete "$DESKTOP\code-conductor.lnk"
   ${EndIf}
 FunctionEnd
 
@@ -225,7 +287,7 @@ Section "Install"
   nsExec::ExecToLog '"$INSTDIR\node\node.exe" "$PLUGINSDIR\setup.mjs" --install-dir "$INSTDIR" --source "${SOURCE}" --branch "${BRANCH}" --projects-root "$ProjectsRoot$R2"'
   Pop $0
   ; Nothing below runs on failure: the stub, uninstaller, Uninstall key
-  ; (DisplayVersion) and shortcut are written only after setup succeeded.
+  ; (DisplayVersion) and shortcuts are written only after setup succeeded.
   ${If} $0 != 0
     Abort "Setup failed (exit $0). See $INSTDIR\logs\setup.log"
   ${EndIf}
@@ -247,6 +309,14 @@ Section "Install"
   WriteRegDWORD HKCU "${UNINST_KEY}" "EstimatedSize" $0
 
   CreateShortcut "$SMPROGRAMS\code-conductor.lnk" "$INSTDIR\code-conductor.exe" "" "$INSTDIR\code-conductor.exe" 0
+  ; The finish page's checkbox decides otherwise; silent installs never show it.
+  ${If} ${Silent}
+    ${If} $NoDesktop == 1
+      Delete "$DESKTOP\code-conductor.lnk"
+    ${Else}
+      Call CreateDesktopShortcut
+    ${EndIf}
+  ${EndIf}
 
   ; The finish page's Launch inherits this process's environment, which
   ; predates setup's PROJECTS_ROOT write.
@@ -262,6 +332,7 @@ Section "Uninstall"
   SetShellVarContext current
   !insertmacro StopRunning "u"
   Delete "$SMPROGRAMS\code-conductor.lnk"
+  Delete "$DESKTOP\code-conductor.lnk"
   RMDir /r "$INSTDIR"
   DeleteRegKey HKCU "${UNINST_KEY}"
   !insertmacro ResolveProjectsRoot
