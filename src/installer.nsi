@@ -1,5 +1,6 @@
 ; Per-user installer + uninstaller. Built by build.mjs, which passes
-; -DVERSION -DCOMMIT -DBRANCH -DREMOTE_URL -DSTAGE -DOUTFILE -DLAUNCHER.
+; -DVERSION -DSOURCE -DBRANCH -DSTAGE -DOUTFILE -DLAUNCHER -DICON.
+; /PROJECTS=<dir> sets the projects folder (also when silent).
 ; What it relies on from cc (launcher path and exit codes, layout):
 ; https://github.com/UnmanagedCode/code-conductor/blob/main/docs/windows.md#installer-contract
 Unicode true
@@ -18,20 +19,54 @@ InstallDir "$LOCALAPPDATA\Programs\code-conductor"
 SetCompressor /SOLID zlib
 ShowInstDetails show
 
+!define MUI_ICON "${ICON}"
+!define MUI_UNICON "${ICON}"
 !define MUI_FINISHPAGE_RUN "$INSTDIR\code-conductor.exe"
 !define MUI_FINISHPAGE_RUN_TEXT "Launch code-conductor"
-!define MUI_FINISHPAGE_TEXT "code-conductor is installed. Your projects live in $PROFILE\code-conductor unless PROJECTS_ROOT is set.$\r$\n$\r$\nIf you have not signed in to Claude yet, run $\"claude auth login$\" once in a terminal."
+!define MUI_FINISHPAGE_TEXT "code-conductor is installed. Your projects live in $ProjectsRoot.$\r$\n$\r$\nIf you have not signed in to Claude yet, run $\"claude auth login$\" once in a terminal."
 
 ; Set only once every install step succeeded; the finish page ("installed",
 ; launch checkbox) is skipped otherwise.
 Var InstallOk
+; The projects folder: /PROJECTS=, else the user PROJECTS_ROOT, else the
+; default (the launcher's own, which an inherited PROJECTS_ROOT overrides).
+Var ProjectsRoot
 
+SpaceTexts none
 !insertmacro MUI_PAGE_LICENSE "${STAGE}\LICENSE"
+!define MUI_PAGE_HEADER_TEXT "Projects folder"
+!define MUI_DIRECTORYPAGE_TEXT_TOP "Choose the folder that holds your projects and code-conductor's .code-conductor store. It is kept when you uninstall. Changing it does not move existing projects."
+!define MUI_DIRECTORYPAGE_TEXT_DESTINATION "Projects folder"
+!define MUI_DIRECTORYPAGE_VARIABLE $ProjectsRoot
+!insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !define MUI_PAGE_CUSTOMFUNCTION_PRE FinishPre
 !insertmacro MUI_PAGE_FINISH
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "English"
+
+; The projects folder as the launcher would resolve it: the user
+; PROJECTS_ROOT, else an inherited one, else the default. Leaves it in $ProjectsRoot.
+!macro ResolveProjectsRoot
+  ReadRegStr $ProjectsRoot HKCU "Environment" "PROJECTS_ROOT"
+  ExpandEnvStrings $ProjectsRoot $ProjectsRoot
+  ${If} $ProjectsRoot == ""
+    ReadEnvStr $ProjectsRoot PROJECTS_ROOT
+  ${EndIf}
+  ${If} $ProjectsRoot == ""
+    StrCpy $ProjectsRoot "$PROFILE\code-conductor"
+  ${EndIf}
+!macroend
+
+Function .onInit
+  ${GetParameters} $0
+  ${GetOptions} $0 "/PROJECTS=" $1
+  ${If} $1 != ""
+    StrCpy $ProjectsRoot $1
+  ${Else}
+    !insertmacro ResolveProjectsRoot
+  ${EndIf}
+FunctionEnd
 
 Function FinishPre
   ${If} $InstallOk != 1
@@ -105,11 +140,18 @@ Section "Install"
 
   InitPluginsDir
   SetOutPath "$PLUGINSDIR"
-  File "${STAGE}\cc.bundle"
   File "${STAGE}\setup.mjs"
   File "${STAGE}\toolchain.mjs"
+  File "${STAGE}\contract.mjs"
+  File "${STAGE}\projects.mjs"
   File "${STAGE}\pins.json"
-  nsExec::ExecToLog '"$INSTDIR\node\node.exe" "$PLUGINSDIR\setup.mjs" --install-dir "$INSTDIR" --bundle "$PLUGINSDIR\cc.bundle" --branch "${BRANCH}" --remote "${REMOTE_URL}" --launcher "${LAUNCHER}"'
+  ; A trailing backslash would escape the closing quote of the argument.
+  StrCpy $0 $ProjectsRoot 1 -1
+  ${DoWhile} $0 == "\"
+    StrCpy $ProjectsRoot $ProjectsRoot -1
+    StrCpy $0 $ProjectsRoot 1 -1
+  ${Loop}
+  nsExec::ExecToLog '"$INSTDIR\node\node.exe" "$PLUGINSDIR\setup.mjs" --install-dir "$INSTDIR" --source "${SOURCE}" --branch "${BRANCH}" --projects-root "$ProjectsRoot"'
   Pop $0
   ; Nothing below runs on failure: the stub, uninstaller, Uninstall key
   ; (DisplayVersion) and shortcut are written only after setup succeeded.
@@ -123,7 +165,7 @@ Section "Install"
 
   ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
   WriteRegStr HKCU "${UNINST_KEY}" "DisplayName" "code-conductor"
-  WriteRegStr HKCU "${UNINST_KEY}" "DisplayVersion" "${VERSION}+${COMMIT}"
+  WriteRegStr HKCU "${UNINST_KEY}" "DisplayVersion" "${VERSION}"
   WriteRegStr HKCU "${UNINST_KEY}" "Publisher" "UnmanagedCode"
   WriteRegStr HKCU "${UNINST_KEY}" "UninstallString" '"$INSTDIR\uninstall.exe"'
   WriteRegStr HKCU "${UNINST_KEY}" "QuietUninstallString" '"$INSTDIR\uninstall.exe" /S'
@@ -133,19 +175,24 @@ Section "Install"
   WriteRegDWORD HKCU "${UNINST_KEY}" "NoRepair" 1
   WriteRegDWORD HKCU "${UNINST_KEY}" "EstimatedSize" $0
 
-  CreateShortcut "$SMPROGRAMS\code-conductor.lnk" "$INSTDIR\code-conductor.exe"
+  CreateShortcut "$SMPROGRAMS\code-conductor.lnk" "$INSTDIR\code-conductor.exe" "" "$INSTDIR\code-conductor.exe" 0
 
-  ; the user PATH may have changed (claude's dir)
+  ; The finish page's Launch inherits this process's environment, which
+  ; predates setup's PROJECTS_ROOT write.
+  System::Call 'kernel32::SetEnvironmentVariable(t "PROJECTS_ROOT", t "$ProjectsRoot")'
+  ; the user PATH and PROJECTS_ROOT may have changed
   SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
   StrCpy $InstallOk 1
 SectionEnd
 
-; Keeps the projects root and its store, Git, claude and the PATH entry.
+; Keeps the projects root (and the user PROJECTS_ROOT naming it) with its
+; store, Git, claude and the PATH entry.
 Section "Uninstall"
   SetShellVarContext current
   !insertmacro StopRunning "u"
   Delete "$SMPROGRAMS\code-conductor.lnk"
   RMDir /r "$INSTDIR"
   DeleteRegKey HKCU "${UNINST_KEY}"
-  DetailPrint "Kept: your projects ($PROFILE\code-conductor unless PROJECTS_ROOT is set), Git, claude and the user PATH entry."
+  !insertmacro ResolveProjectsRoot
+  DetailPrint "Kept: your projects ($ProjectsRoot), the user PROJECTS_ROOT variable, Git, claude and the user PATH entry."
 SectionEnd

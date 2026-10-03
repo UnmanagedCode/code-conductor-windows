@@ -1,7 +1,9 @@
 // Install-time CLI, run by the installer with the bundled node:
-//   node setup.mjs --install-dir D --bundle B --branch X --remote URL --launcher P
-// Ensures Git for Windows and claude, puts claude's dir on the user PATH,
-// creates/fast-forwards the git checkout at <D>\app, and runs `npm ci`.
+//   node setup.mjs --install-dir D --source URL --branch X --projects-root P
+// Validates the projects folder, ensures Git for Windows and claude, puts
+// claude's dir on the user PATH, clones/fast-forwards cc's latest <X> from URL
+// into <D>\app and checks it against the installer contract, runs `npm ci`,
+// and saves the projects folder as the user PROJECTS_ROOT.
 // Progress goes to stdout (the installer's details pane) and logs\setup.log.
 // Any failure exits nonzero, which aborts the installer.
 import crypto from 'node:crypto';
@@ -11,6 +13,8 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { detectGit, detectClaude, addToUserPath, envKey, getEnv, splitPath } from './toolchain.mjs';
+import { contractProblems, contractError } from './contract.mjs';
+import { checkProjectsRoot, persistProjectsRoot } from './projects.mjs';
 
 const w = path.win32;
 
@@ -129,78 +133,125 @@ export async function ensureClaude({ env, log, run = runLogged }) {
   return { claudeExe, dir: w.dirname(claudeExe) };
 }
 
-const gitOut = (git, cwd, args) => new Promise((resolve) => {
-  const c = spawn(git, args, { cwd, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+const gitOut = (git, cwd, args, { raw = false, env } = {}) => new Promise((resolve) => {
+  const c = spawn(git, args, { cwd, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
   let stdout = '';
   c.stdout.on('data', (d) => { stdout += d; });
-  c.on('close', (code) => resolve({ code: code ?? -1, stdout: stdout.trim() }));
+  c.on('close', (code) => resolve({ code: code ?? -1, stdout: raw ? stdout : stdout.trim() }));
 });
+
+// `read(rel)` for contractProblems: the file's text at `rev`, null if absent.
+const showAt = (git, dir, rev, env) => async (rel) => {
+  const r = await gitOut(git, dir, ['show', `${rev}:${rel}`], { raw: true, env });
+  return r.code === 0 ? r.stdout : null;
+};
 
 const RECOVER = 'To recover, uninstall code-conductor (Apps & features), then run this installer again; your projects in the projects root are kept.';
 
-// Fresh install: clone from the bundle (LF, branch + upstream set), then
-// point origin at the real remote. Existing checkout, against the bundle's
-// tip: equal or ahead -> kept; behind -> fast-forwarded (kept if local
-// changes block it); diverged -> refused. Never reset: the checkout may hold
-// self-updated or local commits. Whatever is kept must have `launcher` (the
-// Start-menu entry's path in the checkout), else setup fails. Git config
-// (autocrlf, origin) is touched only once every check has passed.
-export async function checkout({ git, bundle, dir, branch, remoteUrl, launcher, log, env }) {
-  const g = (args, cwd = dir) => mustRun(log, git, args, { cwd, env });
+// A network git command (clone/fetch), retried like downloadWithRetry: the
+// first attempt after a cold network is the one that times out. `onFail`
+// runs after each failed attempt (a fresh clone removes its partial dir).
+async function retryGit(log, git, args, { cwd, env, sleep, attempts = 3, source, branch, onFail }) {
+  let code;
+  for (let i = 1; i <= attempts; i++) {
+    code = await runLogged(log, git, args, { cwd, env });
+    if (code === 0) return;
+    log(`checkout: fetching cc from ${source} failed (attempt ${i}/${attempts}, exit ${code})`);
+    await onFail?.();
+    if (i < attempts) await sleep(2000 * i);
+  }
+  throw new Error(`fetching cc ${branch} from ${source} failed after ${attempts} attempts (exit ${code}). `
+    + 'Check the network connection, then run the installer again. Git\'s output is above in this log.');
+}
+
+// Brings `dir` to cc's latest `branch` from `source`, then proves the result
+// meets the installer contract (contractProblems, against `nodeVersion`).
+// Fresh install: clone (LF, branch + upstream set); a tip that fails the
+// contract fails setup and removes the clone. Existing checkout, against the
+// fetched tip: equal or ahead -> kept; behind -> fast-forwarded (kept if
+// local changes block it, or if the tip fails the contract, so a re-run for
+// Node/Git/claude works while the newest cc is uninstallable); diverged ->
+// refused. Never reset: the checkout may hold self-updated or local commits.
+// Whatever HEAD ends up at must meet the contract, else setup fails. Git
+// config (autocrlf, origin) is touched only once every check has passed.
+// Returns {commit, version} of HEAD.
+export async function checkout({ git, source, dir, branch, nodeVersion, log, env, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
+  // A bad URL must fail, not prompt for credentials.
+  const netEnv = { ...env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
+  const g = (args) => mustRun(log, git, args, { cwd: dir, env });
   // merge-base --is-ancestor: 0 yes, 1 no, anything else an error.
   const isAncestor = async (a, b) => {
     const code = await runLogged(log, git, ['merge-base', '--is-ancestor', a, b], { cwd: dir, env });
     if (code !== 0 && code !== 1) throw new Error(`git merge-base --is-ancestor ${a} ${b} failed (exit ${code})`);
     return code === 0;
   };
+  const head = async (...flags) => (await gitOut(git, dir, ['rev-parse', ...flags, 'HEAD'], { env })).stdout;
+  const fail = (rev, problems) => `${rev}, which does not meet the installer contract:${contractError(problems)}\n`;
   let ffBlocked = false;
   if (!fs.existsSync(path.join(dir, '.git'))) {
     if (fs.existsSync(dir) && fs.readdirSync(dir).length > 0) {
       throw new Error(`${dir} exists, is not a git checkout and is not empty`);
     }
-    log(`checkout: cloning ${branch} from the bundle into ${dir}`);
+    log(`checkout: cloning ${branch} from ${source} into ${dir}`);
     fs.mkdirSync(path.dirname(dir), { recursive: true });
-    await mustRun(log, git, ['-c', 'core.autocrlf=false', '-c', 'core.eol=lf', 'clone', '--branch', branch, bundle, dir], { env });
+    await retryGit(log, git, ['-c', 'core.autocrlf=false', '-c', 'core.eol=lf', 'clone', '--branch', branch, source, dir],
+      { env: netEnv, sleep, source, branch, onFail: () => fs.rmSync(dir, { recursive: true, force: true }) });
+    const { problems } = await contractProblems(showAt(git, dir, 'HEAD', env), nodeVersion);
+    if (problems.length) {
+      const short = await head('--short=8');
+      fs.rmSync(dir, { recursive: true, force: true });
+      throw new Error(`The latest cc ${branch} (${short}) from ${source} cannot be installed: it does not meet the installer contract:${contractError(problems)}\n`
+        + 'Try again later, or use a newer installer release.');
+    }
   } else {
     log(`checkout: existing checkout at ${dir}`);
-    await g(['fetch', bundle, branch]);
-    const same = await gitOut(git, dir, ['rev-parse', 'HEAD', 'FETCH_HEAD']);
-    const [head, tip] = same.stdout.split('\n');
-    if (same.code !== 0 || !head || !tip) throw new Error(`git rev-parse HEAD FETCH_HEAD failed in ${dir} (exit ${same.code})`);
-    const [h, t] = [head.slice(0, 8), tip.slice(0, 8)];
-    if (head === tip) {
-      log('checkout: already at the installer\'s commit');
-    } else if (await isAncestor(head, tip)) {
-      log(`checkout: fast-forwarding ${h} -> ${t}`);
-      if ((await runLogged(log, git, ['merge', '--ff-only', tip], { cwd: dir, env })) !== 0) {
-        log(`checkout: NOT fast-forwarded (local changes in the way); kept ${h}`);
-        ffBlocked = true;
+    await retryGit(log, git, ['fetch', source, branch], { cwd: dir, env: netEnv, sleep, source, branch });
+    const same = await gitOut(git, dir, ['rev-parse', 'HEAD', 'FETCH_HEAD'], { env });
+    const [headSha, tip] = same.stdout.split('\n');
+    if (same.code !== 0 || !headSha || !tip) throw new Error(`git rev-parse HEAD FETCH_HEAD failed in ${dir} (exit ${same.code})`);
+    const [h, t] = [headSha.slice(0, 8), tip.slice(0, 8)];
+    if (headSha === tip) {
+      log(`checkout: already at the latest ${branch}`);
+    } else if (await isAncestor(headSha, tip)) {
+      const { problems } = await contractProblems(showAt(git, dir, tip, env), nodeVersion);
+      if (problems.length) {
+        log(`checkout: the latest ${branch} ${t} does not meet the installer contract; kept ${h}:`);
+        for (const p of problems) log(`  - ${p}`);
+      } else {
+        log(`checkout: fast-forwarding ${h} -> ${t}`);
+        if ((await runLogged(log, git, ['merge', '--ff-only', tip], { cwd: dir, env })) !== 0) {
+          log(`checkout: NOT fast-forwarded (local changes in the way); kept ${h}`);
+          ffBlocked = true;
+        }
       }
-    } else if (await isAncestor(tip, head)) {
-      log(`checkout: kept ${h}; it is ahead of the installer's commit ${t}`);
+    } else if (await isAncestor(tip, headSha)) {
+      log(`checkout: kept ${h}; it is ahead of the latest ${branch} ${t}`);
     } else {
-      throw new Error(`${dir} is at ${h}, which has diverged from this installer's commit ${t} (neither contains the other). `
+      throw new Error(`${dir} is at ${h}, which has diverged from the latest ${branch} ${t} (neither contains the other). `
         + `Setup does not reset it, since it may hold your own commits. ${RECOVER}`);
     }
   }
-  if (!fs.existsSync(path.join(dir, ...launcher.split(/[\\/]/)))) {
-    const head = (await gitOut(git, dir, ['rev-parse', '--short=8', 'HEAD'])).stdout;
-    throw new Error(`${dir} is at ${head}, which has no ${launcher}, so code-conductor could not be started from it. ${RECOVER}`);
-  }
+  const { problems, version } = await contractProblems(showAt(git, dir, 'HEAD', env), nodeVersion);
+  const commit = await head();
+  if (problems.length) throw new Error(`${dir} is at ${fail(commit.slice(0, 8), problems)}${RECOVER}`);
   await g(['config', 'core.autocrlf', 'false']);
-  await g(['remote', 'set-url', 'origin', remoteUrl]);
+  await g(['remote', 'set-url', 'origin', source]);
   if (ffBlocked) log('checkout: in-app self-update will fast-forward it once the local changes are resolved');
+  log(`checkout: installed cc ${version} at ${commit} (${branch} from ${source})`);
+  return { commit, version };
 }
 
 export async function main(argv, env = process.env) {
   const args = {};
   for (let i = 0; i < argv.length; i += 2) args[argv[i].replace(/^--/, '')] = argv[i + 1];
-  for (const k of ['install-dir', 'bundle', 'branch', 'remote', 'launcher']) {
+  for (const k of ['install-dir', 'source', 'branch', 'projects-root']) {
     if (!args[k]) throw new Error(`missing --${k}`);
   }
   const installDir = args['install-dir'];
   const log = makeLogger(path.join(installDir, 'logs', 'setup.log'));
   const pins = JSON.parse(fs.readFileSync(new URL('./pins.json', import.meta.url), 'utf8'));
+  // Before any download: a bad folder should fail in seconds.
+  const projectsRoot = checkProjectsRoot(args['projects-root'], installDir);
 
   const git = await ensureGit({ env, pin: pins.git, log });
   const claude = await ensureClaude({ env, log });
@@ -214,11 +265,13 @@ export async function main(argv, env = process.env) {
   // Bundled node first, so `npm ci` and its children use the bundled npm.
   const pathKey = envKey(env, 'PATH') || 'Path';
   const toolEnv = { ...env, [pathKey]: [w.join(installDir, 'node'), git.cmdDir, ...splitPath(getEnv(env, 'PATH'))].join(';') };
-  await checkout({ git: git.gitExe, bundle: args.bundle, dir: appDir, branch: args.branch, remoteUrl: args.remote, launcher: args.launcher, log, env: toolEnv });
+  // The running node is the bundled one.
+  await checkout({ git: git.gitExe, source: args.source, dir: appDir, branch: args.branch, nodeVersion: process.versions.node, log, env: toolEnv });
 
   log('npm: npm ci');
   const npmCli = path.join(installDir, 'node', 'node_modules', 'npm', 'bin', 'npm-cli.js');
   await mustRun(log, path.join(installDir, 'node', 'node.exe'), [npmCli, 'ci'], { cwd: appDir, env: toolEnv });
+  await persistProjectsRoot(projectsRoot, { runPs: runPowerShell, env, log });
   log('setup complete');
 }
 

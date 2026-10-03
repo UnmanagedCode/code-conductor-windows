@@ -1,8 +1,9 @@
-// Builds the per-user Windows installer on Linux from a chosen cc source and ref:
-//   npm run build -- [--source URL|PATH] [--ref REF] [--branch B] [--remote-url URL]
+// Builds the per-user Windows installer on Linux. The installer is not tied
+// to a cc commit: it clones cc's latest <branch> from <source> at install time.
+//   npm run build -- [--source URL|PATH] [--branch B]
+// --source/--branch are baked in as the install-time defaults (for test builds).
 // Env: MAKENSIS (default makensis). Reproducible in its inputs (pinned node +
-// the resolved cc commit + this repo's sources), not byte-identical.
-// What a cc ref must provide: CONTRACT_URL.
+// this repo's sources), not byte-identical.
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -10,16 +11,13 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
+import { LAUNCHER_REL } from './contract.mjs';
 
 export const DEFAULT_SOURCE = 'https://github.com/UnmanagedCode/code-conductor.git';
-export const CONTRACT_URL = 'https://github.com/UnmanagedCode/code-conductor/blob/main/docs/windows.md#installer-contract';
-// The launcher inside the checkout (contract C4); the stub and the
-// installer's StopRunning get it as the LAUNCHER define.
-export const LAUNCHER_REL = 'bin/windows-launch.mjs';
-const ENGINES_RE = /^>=\s*(\d+)(?:\.(\d+))?(?:\.(\d+))?$/;
 // This repo's files that ship inside the installer.
-const SHIPPED = ['setup.mjs', 'toolchain.mjs', 'pins.json', 'installer.nsi', 'launcher.nsi'];
+const SHIPPED = ['setup.mjs', 'toolchain.mjs', 'contract.mjs', 'projects.mjs', 'pins.json', 'installer.nsi', 'launcher.nsi', 'icon.ico'];
 const srcDir = path.dirname(fileURLToPath(import.meta.url));
+const repoDir = path.resolve(srcDir, '..');
 
 const sha256 = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 
@@ -55,97 +53,29 @@ async function fetchPinned(pin, cacheDir, download, log) {
   return file;
 }
 
-const versionParts = (v) => v.split('.').map(Number);
-
-// Whether `version` (N.N.N) satisfies `range` (>=N[.N[.N]]); null when the
-// range is not of that form.
-export function satisfiesEngines(version, range) {
-  const m = ENGINES_RE.exec(range);
-  if (!m) return null;
-  const want = [m[1], m[2] ?? '0', m[3] ?? '0'].map(Number);
-  const have = versionParts(version);
-  for (let i = 0; i < 3; i++) {
-    if ((have[i] ?? 0) !== want[i]) return (have[i] ?? 0) > want[i];
-  }
-  return true;
-}
-
-// The contract checks a cc commit must pass before it is bundled. Returns
-// {version} or throws listing every failed check.
-function checkContract(git, commit, nodeVersion) {
-  const problems = [];
-  for (const f of [LAUNCHER_REL, 'package.json', 'package-lock.json', 'LICENSE']) {
-    if (git(['cat-file', '-e', `${commit}:${f}`], { allowFail: true }).status !== 0) problems.push(`${f} is missing`);
-  }
-  let pkg = {};
-  const shown = git(['show', `${commit}:package.json`], { allowFail: true });
-  if (shown.status === 0) {
-    try { pkg = JSON.parse(shown.stdout); } catch (e) { problems.push(`package.json does not parse: ${e.message}`); }
-  }
-  if (typeof pkg.version !== 'string') problems.push('package.json has no string "version"');
-  // `npm ci` on the user's machine has only the bundled node + npm, no build toolchain.
-  const lock = git(['show', `${commit}:package-lock.json`], { allowFail: true });
-  if (lock.status === 0) {
-    try {
-      const scripted = Object.entries(JSON.parse(lock.stdout).packages ?? {}).filter(([, p]) => p.hasInstallScript).map(([k]) => k);
-      if (scripted.length) problems.push(`package-lock.json has packages with install scripts: ${scripted.join(', ')}`);
-    } catch (e) { problems.push(`package-lock.json does not parse: ${e.message}`); }
-  }
-  const range = pkg.engines?.node;
-  const ok = typeof range === 'string' ? satisfiesEngines(nodeVersion, range) : null;
-  if (ok === null) problems.push(`package.json engines.node ${JSON.stringify(range)} is not of the form >=N[.N[.N]]`);
-  else if (!ok) problems.push(`the pinned Node ${nodeVersion} does not satisfy engines.node "${range}"`);
-  if (problems.length) {
-    throw new Error(`cc commit ${commit.slice(0, 8)} does not meet the installer contract (${CONTRACT_URL}):\n  - ${problems.join('\n  - ')}`);
-  }
-  return { version: pkg.version };
-}
-
 export async function buildInstaller({
-  source = DEFAULT_SOURCE, ref = 'main', branch = 'main', remoteUrl = DEFAULT_SOURCE,
+  source = DEFAULT_SOURCE, branch = 'main',
   outDir, cacheDir, pins, makensis = 'makensis', log = console.log, download = defaultDownload, stageDir,
 }) {
-  for (const tool of [makensis, 'git', 'unzip', 'tar']) {
+  for (const tool of [makensis, 'unzip']) {
     const r = spawnSync(tool, ['--version'], { encoding: 'utf8' });
     if (r.error && r.error.code === 'ENOENT') {
       throw new Error(`${tool} not found${tool === makensis ? ' (sudo apt install nsis)' : ''}`);
     }
   }
+  // Both reach the makensis command line as -D defines.
+  for (const [name, value] of [['source', source], ['branch', branch]]) {
+    if (!value || /["\s]/.test(value)) throw new Error(`--${name} must be non-empty and contain no whitespace or double quote: ${JSON.stringify(value)}`);
+  }
+  if (source !== DEFAULT_SOURCE || branch !== 'main') log(`install-time defaults baked in: ${branch} from ${source}`);
+  const { version } = JSON.parse(fs.readFileSync(path.join(repoDir, 'package.json'), 'utf8'));
 
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-win-build-'));
   try {
-    const bare = path.join(work, 'cc.git');
-    run('git', ['init', '-q', '--bare', bare]);
-    const git = (args, opts) => run('git', ['-C', bare, ...args], opts);
-    log(`cc: fetching ${source}`);
-    // A local path is relative to the caller's cwd, not the temp repo's.
-    git(['fetch', '-q', fs.existsSync(source) ? path.resolve(source) : source,'+refs/heads/*:refs/remotes/src/*', '+refs/tags/*:refs/tags/*']);
-
-    const resolve = (r) => {
-      const res = git(['rev-parse', '--verify', '-q', `${r}^{commit}`], { allowFail: true });
-      return res.status === 0 ? res.stdout.trim() : null;
-    };
-    const commit = resolve(`refs/remotes/src/${ref}`) ?? resolve(`refs/tags/${ref}`) ?? resolve(ref);
-    if (!commit) throw new Error(`ref ${JSON.stringify(ref)} is not a branch, tag or commit in ${source}`);
-    const short = commit.slice(0, 8);
-    log(`cc: ${ref} is ${commit}`);
-    const { version } = checkContract(git, commit, pins.node.version);
-    log(`cc: contract checks passed (${LAUNCHER_REL}, package.json version ${version}, engines.node, package-lock.json without install scripts, LICENSE)`);
-
-    const branchRef = `refs/remotes/src/${branch}`;
-    if (resolve(branchRef) && git(['merge-base', '--is-ancestor', commit, branchRef], { allowFail: true }).status !== 0) {
-      log(`warning: ${short} is not contained in ${branch} at the source; the installed checkout will report ahead or diverged in self-update until the commit is on ${branch}`);
-    }
-
     const stage = stageDir ?? path.join(work, 'stage');
     fs.rmSync(stage, { recursive: true, force: true });
     fs.mkdirSync(stage, { recursive: true });
-
-    git(['update-ref', `refs/heads/${branch}`, commit]);
-    const bundle = path.join(stage, 'cc.bundle');
-    git(['bundle', 'create', '-q', bundle, `refs/heads/${branch}`]);
-    git(['bundle', 'verify', '-q', bundle]);
-    fs.writeFileSync(path.join(stage, 'LICENSE'), git(['show', `${commit}:LICENSE`], { encoding: 'buffer' }).stdout);
+    fs.copyFileSync(path.join(repoDir, 'LICENSE'), path.join(stage, 'LICENSE'));
     for (const f of SHIPPED) fs.copyFileSync(path.join(srcDir, f), path.join(stage, f));
 
     const zip = await fetchPinned(pins.node, cacheDir, download, log);
@@ -157,37 +87,33 @@ export async function buildInstaller({
     fs.renameSync(root, path.join(stage, 'node'));
 
     const launcher = `-DLAUNCHER=${LAUNCHER_REL.replaceAll('/', '\\')}`;
-    run(makensis, ['-V2', `-DOUTFILE=${path.join(stage, 'code-conductor.exe')}`, launcher, path.join(stage, 'launcher.nsi')]);
+    const icon = `-DICON=${path.join(stage, 'icon.ico')}`;
+    run(makensis, ['-V2', `-DOUTFILE=${path.join(stage, 'code-conductor.exe')}`, launcher, icon, path.join(stage, 'launcher.nsi')]);
     fs.mkdirSync(outDir, { recursive: true });
-    const outFile = path.join(outDir, `code-conductor-setup-${version}-${short}.exe`);
+    const outFile = path.join(outDir, `code-conductor-setup-${version}.exe`);
     run(makensis, [
-      '-V2', `-DVERSION=${version}`, `-DCOMMIT=${short}`, `-DBRANCH=${branch}`,
-      `-DREMOTE_URL=${remoteUrl}`, `-DSTAGE=${stage}`, `-DOUTFILE=${outFile}`, launcher,
+      '-V2', `-DVERSION=${version}`, `-DSOURCE=${source}`, `-DBRANCH=${branch}`,
+      `-DSTAGE=${stage}`, `-DOUTFILE=${outFile}`, launcher, icon,
       path.join(stage, 'installer.nsi'),
     ]);
     if (!fs.existsSync(outFile)) throw new Error(`makensis did not produce ${outFile}`);
     log(`built ${outFile}`);
-    return { outFile, version, commit };
+    return { outFile, version };
   } finally {
     fs.rmSync(work, { recursive: true, force: true });
   }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const repoDir = path.resolve(srcDir, '..');
   const { values } = parseArgs({
     options: {
       source: { type: 'string', default: DEFAULT_SOURCE },
-      ref: { type: 'string', default: 'main' },
       branch: { type: 'string', default: 'main' },
-      'remote-url': { type: 'string', default: DEFAULT_SOURCE },
     },
   });
   buildInstaller({
     source: values.source,
-    ref: values.ref,
     branch: values.branch,
-    remoteUrl: values['remote-url'],
     outDir: path.join(repoDir, 'build'),
     cacheDir: path.join(repoDir, 'build', 'cache'),
     pins: JSON.parse(fs.readFileSync(path.join(srcDir, 'pins.json'), 'utf8')),
