@@ -122,7 +122,13 @@ Output: `build/code-conductor-setup-<package.json version>-<short8 sha>.exe`. Re
 ```
 npm test                                        # node --test, no network, no deps
 RUN_WIN_INSTALLER_BUILD=1 node --test tests/build.real.test.mjs
-PWSH=<path to pwsh or powershell.exe> node --test tests/userpath.pwsh.test.mjs
+PWSH=<path to pwsh> node --test tests/userpath.pwsh.test.mjs
+```
+
+On a Windows host, run the PowerShell suite with `PWSH=powershell.exe`. Windows PowerShell 5.1 is what `setup.mjs` runs, so that variant is the one that counts there; pwsh 7 on Linux only proves the scripts and the encoding path.
+
+```
+$env:PWSH = 'powershell.exe'; node --test tests/userpath.pwsh.test.mjs   # in a PowerShell prompt
 ```
 
 | File | Covers |
@@ -132,4 +138,4 @@ PWSH=<path to pwsh or powershell.exe> node --test tests/userpath.pwsh.test.mjs
 | `tests/checkout.test.mjs` | `checkout()` with real git: fresh clone (LF, upstream, origin), fast-forward, never downgrade, a dirty tree kept |
 | `tests/setup.test.mjs` | `ensureGit` sha refusal, `downloadWithRetry` |
 | `tests/toolchain.test.mjs` | `detectGit` layouts (mirroring cc's C8, plus the rejected `usr\bin`/`mingw64\bin`), `detectClaude`, `findOnPath`, `addToUserPath` against a fake of the PowerShell channel (base64 JSON both ways, exit 1 with localized stderr, non-ASCII round-trip) |
-| `tests/userpath.pwsh.test.mjs` | Gated by `PWSH`: the real user-Path scripts run by real PowerShell through `runPowerShell`, with `HKCU\Environment` swapped for a fake key, so the encoding path is exercised end to end (non-ASCII round-trip, kinds, failure exit codes) |
+| `tests/userpath.pwsh.test.mjs` | Gated by `PWSH`: the real user-Path scripts run by real PowerShell through `runPowerShell`, with `HKCU\Environment` swapped for a fake key, so the encoding path is exercised end to end (non-ASCII round-trip, a multi-KB Path past the command-line limit, kinds, failure exit codes) |

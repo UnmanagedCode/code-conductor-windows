@@ -2,7 +2,9 @@
 // HKCU\Environment swapped for a fake key backed by a JSON file, so the
 // encoding path (-EncodedCommand, base64 over stdin/stdout, JSON in both
 // directions) is exercised end to end on any OS:
-//   PWSH=<path to pwsh or powershell.exe> node --test tests/userpath.pwsh.test.mjs
+//   PWSH=<path to pwsh> node --test tests/userpath.pwsh.test.mjs
+// On a Windows host run it with PWSH=powershell.exe: Windows PowerShell 5.1
+// is what setup.mjs runs, so that is the variant that counts there.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -43,6 +45,23 @@ t('non-ASCII Path entries round-trip through real PowerShell, kind kept', { time
   try {
     assert.equal(await addToUserPath(dir, { runPs: s.runPs, env: {} }), true);
     assert.deepEqual(s.read(), { exists: true, kind: 'ExpandString', value: `${existing};${dir}` });
+    assert.equal(await addToUserPath(dir, { runPs: s.runPs, env: {} }), false);
+  } finally { s.cleanup(); }
+});
+
+// Past the 32767-char command-line limit, so only stdin/stdout can carry it.
+t('a Path of thousands of entries (non-ASCII, %VAR%) round-trips untruncated', { timeout: 120_000 }, async () => {
+  const kinds = [(i) => `C:\\Users\\Müller\\tools\\dir${i}`, (i) => `%USERPROFILE%\\工具\\${i}`, (i) => `D:\\Ångström\\bin${i}`];
+  const existing = Array.from({ length: 3000 }, (_, i) => kinds[i % kinds.length](i)).join(';');
+  assert.ok(existing.length > 32767);
+  const dir = 'C:\\Users\\Müller\\.local\\bin';
+  const s = setup({ exists: true, kind: 'ExpandString', value: existing });
+  try {
+    assert.equal(await addToUserPath(dir, { runPs: s.runPs, env: {} }), true);
+    const after = s.read();
+    assert.equal(after.kind, 'ExpandString');
+    assert.equal(after.value.length, existing.length + 1 + dir.length);
+    assert.equal(after.value, `${existing};${dir}`);
     assert.equal(await addToUserPath(dir, { runPs: s.runPs, env: {} }), false);
   } finally { s.cleanup(); }
 });
