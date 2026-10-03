@@ -9,6 +9,8 @@ Unicode true
 !include "WinMessages.nsh"
 !include "FileFunc.nsh"
 !include "TextFunc.nsh"
+!include "WordFunc.nsh"
+!insertmacro WordReplace
 
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\code-conductor"
 
@@ -58,11 +60,74 @@ SpaceTexts none
   ${EndIf}
 !macroend
 
+; Reads /PROJECTS= from $CMDLINE into $ProjectsRoot and sets $R9 to 1 when
+; the switch is present. GetOptions is not used: it misses the whole-token
+; quoted form and truncates at a second "/". Accepted forms:
+;   /PROJECTS="D:\My projects"   /PROJECTS=D:/x   "/PROJECTS=D:\My projects"
+; The switch must start a token (line start, after a space or a quote). A
+; quoted value, or a whole-token quote, ends at the next quote; an unquoted
+; value ends at the next space. "/" in the value becomes "\".
+Function ParseProjectsSwitch
+  StrCpy $R9 0
+  StrCpy $ProjectsRoot ""
+  StrLen $R0 $CMDLINE
+  StrCpy $R1 0
+  ${Do}
+    ${If} $R1 >= $R0
+      ${Break}
+    ${EndIf}
+    StrCpy $R2 $CMDLINE 10 $R1
+    ${If} $R2 == "/PROJECTS="
+      StrCpy $R3 " "
+      ${If} $R1 > 0
+        IntOp $R4 $R1 - 1
+        StrCpy $R3 $CMDLINE 1 $R4
+      ${EndIf}
+      ${If} $R3 == " "
+      ${OrIf} $R3 == '"'
+        StrCpy $R9 1
+        IntOp $R5 $R1 + 10
+        StrCpy $R6 $CMDLINE "" $R5
+        ; $R7: the character that ends the value
+        StrCpy $R7 " "
+        ${If} $R3 == '"'
+          StrCpy $R7 '"'
+        ${Else}
+          StrCpy $R4 $R6 1
+          ${If} $R4 == '"'
+            StrCpy $R7 '"'
+            StrCpy $R6 $R6 "" 1
+          ${EndIf}
+        ${EndIf}
+        StrLen $R8 $R6
+        StrCpy $R5 0
+        ${Do}
+          ${If} $R5 >= $R8
+            ${Break}
+          ${EndIf}
+          StrCpy $R4 $R6 1 $R5
+          ${If} $R4 == $R7
+            ${Break}
+          ${EndIf}
+          StrCpy $ProjectsRoot "$ProjectsRoot$R4"
+          IntOp $R5 $R5 + 1
+        ${Loop}
+        ${Break}
+      ${EndIf}
+    ${EndIf}
+    IntOp $R1 $R1 + 1
+  ${Loop}
+  ${WordReplace} "$ProjectsRoot" "/" "\" "+*" $ProjectsRoot
+FunctionEnd
+
 Function .onInit
-  ${GetParameters} $0
-  ${GetOptions} $0 "/PROJECTS=" $1
-  ${If} $1 != ""
-    StrCpy $ProjectsRoot $1
+  Call ParseProjectsSwitch
+  ${If} $R9 == 1
+    ; A given switch is never silently replaced by another folder.
+    ${If} $ProjectsRoot == ""
+      MessageBox MB_OK|MB_ICONSTOP "/PROJECTS= needs a folder, for example /PROJECTS=$\"D:\My projects$\"." /SD IDOK
+      Abort
+    ${EndIf}
   ${Else}
     !insertmacro ResolveProjectsRoot
   ${EndIf}
@@ -145,13 +210,19 @@ Section "Install"
   File "${STAGE}\contract.mjs"
   File "${STAGE}\projects.mjs"
   File "${STAGE}\pins.json"
-  ; A trailing backslash would escape the closing quote of the argument.
-  StrCpy $0 $ProjectsRoot 1 -1
+  ; Windows argv rule: backslashes before the closing quote escape it unless
+  ; doubled, so each trailing backslash is doubled; a drive root reaches
+  ; setup.mjs intact.
+  ; setup.mjs's checkProjectsRoot is the one place that strips a non-root one.
+  StrCpy $R2 ""
+  StrCpy $R3 $ProjectsRoot
+  StrCpy $0 $R3 1 -1
   ${DoWhile} $0 == "\"
-    StrCpy $ProjectsRoot $ProjectsRoot -1
-    StrCpy $0 $ProjectsRoot 1 -1
+    StrCpy $R2 "$R2\"
+    StrCpy $R3 $R3 -1
+    StrCpy $0 $R3 1 -1
   ${Loop}
-  nsExec::ExecToLog '"$INSTDIR\node\node.exe" "$PLUGINSDIR\setup.mjs" --install-dir "$INSTDIR" --source "${SOURCE}" --branch "${BRANCH}" --projects-root "$ProjectsRoot"'
+  nsExec::ExecToLog '"$INSTDIR\node\node.exe" "$PLUGINSDIR\setup.mjs" --install-dir "$INSTDIR" --source "${SOURCE}" --branch "${BRANCH}" --projects-root "$ProjectsRoot$R2"'
   Pop $0
   ; Nothing below runs on failure: the stub, uninstaller, Uninstall key
   ; (DisplayVersion) and shortcut are written only after setup succeeded.
