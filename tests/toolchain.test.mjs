@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { detectGit, detectClaude, addToUserPath, findOnPath, userPathScript } from '../src/toolchain.mjs';
+import { detectGit, detectClaude, addToUserPath, findOnPath, userEnvScript, readUserEnv, writeUserEnv } from '../src/toolchain.mjs';
 
 const w = path.win32;
 const existsIn = (...files) => {
@@ -95,31 +95,35 @@ test('findOnPath: case-insensitive PATH key', () => {
   assert.equal(findOnPath('git', { pAtH: 'C:\\a;C:\\b' }, existsIn('C:\\b\\git.exe')), 'C:\\b\\git.exe');
 });
 
-// Models the userPathScript channel over a fake HKCU\Environment: `read`
-// prints base64(UTF-8 JSON {exists, kind, value}); `write` decodes
-// base64(UTF-8 JSON {value, kind}) from stdin, refuses a kind other than
+// Models the userEnvScript channel over a fake HKCU\Environment keyed by
+// `name`: `read` takes base64(UTF-8 JSON {name}) and prints
+// base64(UTF-8 JSON {exists, kind, value}); `write` decodes
+// base64(UTF-8 JSON {name, value, kind}) from stdin, refuses a kind other than
 // String/ExpandString or a non-string value, and stores it. Failures are exit
-// 1 with a (localized) message on stderr. `value` is null when absent.
+// 1 with a (localized) message on stderr. `value` is null when absent. The
+// helper's own `Path` is the one under test; `store` is its entry.
 const b64 = (o) => Buffer.from(JSON.stringify(o), 'utf8').toString('base64');
 function fakePs(value, { kind = 'ExpandString', readFail, writeFail } = {}) {
   const calls = [];
-  let store = value === null ? null : { kind, value };
+  const stores = value === null ? {} : { Path: { kind, value } };
   return {
     calls,
-    get store() { return store; },
+    get store() { return stores.Path ?? null; },
+    stores,
     runPs: async (script, input) => {
-      if (script === userPathScript('read')) {
-        calls.push({ op: 'read', input });
+      assert.match(input, /^[A-Za-z0-9+/]+={0,2}$/, 'only base64 crosses the pipe');
+      const req = JSON.parse(Buffer.from(input, 'base64').toString('utf8'));
+      if (script === userEnvScript('read')) {
+        calls.push({ op: 'read', req });
         if (readFail !== undefined) return { code: 1, stdout: '', stderr: readFail };
-        return { code: 0, stdout: b64(store ? { exists: true, ...store } : { exists: false }) + '\r\n', stderr: '' };
+        const st = stores[req.name];
+        return { code: 0, stdout: b64(st ? { exists: true, ...st } : { exists: false }) + '\r\n', stderr: '' };
       }
-      if (script === userPathScript('write')) {
-        calls.push({ op: 'write', input });
+      if (script === userEnvScript('write')) {
+        calls.push({ op: 'write', req });
         if (writeFail !== undefined) return { code: 1, stdout: '', stderr: writeFail };
-        assert.match(input, /^[A-Za-z0-9+/]+={0,2}$/, 'only base64 crosses the pipe');
-        const req = JSON.parse(Buffer.from(input, 'base64').toString('utf8'));
         if (!['String', 'ExpandString'].includes(req.kind) || typeof req.value !== 'string') return { code: 1, stdout: '', stderr: 'refusing' };
-        store = { kind: req.kind, value: req.value };
+        stores[req.name] = { kind: req.kind, value: req.value };
         return { code: 0, stdout: '', stderr: '' };
       }
       throw new Error('unexpected script');
@@ -127,6 +131,13 @@ function fakePs(value, { kind = 'ExpandString', readFail, writeFail } = {}) {
   };
 }
 const writes = (f) => f.calls.filter((c) => c.op === 'write');
+
+// Invariant: addToUserPath addresses the value `Path` on both the read and the write.
+test('addToUserPath: reads and writes the value named Path', async () => {
+  const f = fakePs('C:\\a');
+  await addToUserPath('C:\\n', { runPs: f.runPs, env: {} });
+  assert.deepEqual(f.calls.map((c) => [c.op, c.req.name]), [['read', 'Path'], ['write', 'Path']]);
+});
 
 test('addToUserPath: appends once, keeps %VAR% and the ExpandString kind', async () => {
   const f = fakePs('%USERPROFILE%\\bin;C:\\Tools');
@@ -206,10 +217,26 @@ test('addToUserPath: a failed write throws', async () => {
   await assert.rejects(addToUserPath('C:\\n', { runPs: f.runPs, env: {} }), /writing the user Path failed \(exit 1\): Path read back differs/);
 });
 
-test('userPathScript: reads unexpanded, never through reg.exe', () => {
+// Invariant: values are read unexpanded and never through reg.exe, and both
+// ops take the value name from the request, never from the script text.
+test('userEnvScript: reads unexpanded, never through reg.exe, name comes from the request', () => {
   for (const op of ['read', 'write']) {
-    const s = userPathScript(op);
+    const s = userEnvScript(op);
     assert.match(s, /'DoNotExpandEnvironmentNames'/);
     assert.doesNotMatch(s, /reg(\.exe)?\s+(query|add)/i);
+    assert.match(s, /\$req\.name/);
+    assert.doesNotMatch(s, /'Path'/);
   }
+});
+
+// Invariant: readUserEnv / writeUserEnv carry any value name through the
+// channel, so PROJECTS_ROOT and Path do not interfere.
+test('readUserEnv / writeUserEnv: addressed by name', async () => {
+  const f = fakePs('C:\\a');
+  await writeUserEnv('PROJECTS_ROOT', 'D:\\p', 'String', { runPs: f.runPs });
+  assert.deepEqual(await readUserEnv('PROJECTS_ROOT', { runPs: f.runPs }), { exists: true, kind: 'String', value: 'D:\\p' });
+  assert.deepEqual(await readUserEnv('Absent', { runPs: f.runPs }), { exists: false });
+  assert.equal(f.store.value, 'C:\\a');
+  await assert.rejects(readUserEnv('X', { runPs: fakePs('v', { readFail: 'denied' }).runPs }), /reading the user X failed \(exit 1\): denied/);
+  await assert.rejects(writeUserEnv('X', 'v', 'Binary', { runPs: f.runPs }), /writing the user X failed/);
 });

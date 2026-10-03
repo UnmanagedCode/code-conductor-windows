@@ -1,4 +1,4 @@
-// Tool detection and the user PATH write used by setup.mjs. Pure over an
+// Tool detection and the user environment (Path, PROJECTS_ROOT) access used by setup.mjs. Pure over an
 // injected `env` / `exists` / `runPs` so Linux tests exercise the Windows logic;
 // every path op is `path.win32`.
 //
@@ -78,34 +78,38 @@ export function detectClaude(env, exists = fs.existsSync) {
   return null;
 }
 
-// The user Path (HKCU\Environment\Path) is read and written by PowerShell
-// through .NET's registry API, never reg.exe: reg.exe prints in the console
-// code page, so a non-ASCII entry would come back mangled and be written back
-// corrupted. Only base64 of UTF-8 JSON crosses the pipes, so no code page
-// applies. `read` prints {exists, kind, value} (value unexpanded); `write`
-// takes {value, kind} on stdin, writes it and reads it back to verify. Any
-// failure exits 1 with the message on stderr.
+// HKCU\Environment values (the user Path, PROJECTS_ROOT) are read and written
+// by PowerShell through .NET's registry API, never reg.exe: reg.exe prints in
+// the console code page, so a non-ASCII value would come back mangled and be
+// written back corrupted. Only base64 of UTF-8 JSON crosses the pipes, so no
+// code page applies. `read` takes {name} on stdin and prints
+// {exists, kind, value} (value unexpanded); `write` takes {name, value, kind},
+// writes it and reads it back to verify. The name is only ever a .NET
+// argument, never spliced into script text. Any failure exits 1 with the
+// message on stderr.
 const PS_OPEN = {
   read: "$k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $false)",
   write: "$k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)",
 };
+const PS_REQ = '$req = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd().Trim())) | ConvertFrom-Json';
 const PS_BODY = {
   read: `
-$v = $k.GetValue('Path', $null, 'DoNotExpandEnvironmentNames')
-if ($null -eq $v) { $o = @{ exists = $false } } else { $o = @{ exists = $true; kind = $k.GetValueKind('Path').ToString(); value = $v } }
+${PS_REQ}
+$v = $k.GetValue($req.name, $null, 'DoNotExpandEnvironmentNames')
+if ($null -eq $v) { $o = @{ exists = $false } } else { $o = @{ exists = $true; kind = $k.GetValueKind($req.name).ToString(); value = $v } }
 [Console]::Out.Write([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -Compress -InputObject $o))))`,
   write: `
-$req = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd().Trim())) | ConvertFrom-Json
-if ($req.kind -cne 'String' -and $req.kind -cne 'ExpandString') { throw "refusing to write Path as kind $($req.kind)" }
-if ($req.value -isnot [string]) { throw 'refusing to write a non-string Path' }
-$k.SetValue('Path', $req.value, [Microsoft.Win32.RegistryValueKind]$req.kind)
-$back = $k.GetValue('Path', $null, 'DoNotExpandEnvironmentNames')
-if ($back -cne $req.value -or $k.GetValueKind('Path').ToString() -cne $req.kind) { throw 'Path read back differs from what was written' }`,
+${PS_REQ}
+if ($req.kind -cne 'String' -and $req.kind -cne 'ExpandString') { throw "refusing to write $($req.name) as kind $($req.kind)" }
+if ($req.value -isnot [string]) { throw "refusing to write a non-string $($req.name)" }
+$k.SetValue($req.name, $req.value, [Microsoft.Win32.RegistryValueKind]$req.kind)
+$back = $k.GetValue($req.name, $null, 'DoNotExpandEnvironmentNames')
+if ($back -cne $req.value -or $k.GetValueKind($req.name).ToString() -cne $req.kind) { throw "$($req.name) read back differs from what was written" }`,
 };
 
 // The PowerShell script for `op` ('read' | 'write'). `openKey` is the line
 // that sets `$k`; tests swap it for a fake key.
-export function userPathScript(op, openKey = PS_OPEN[op]) {
+export function userEnvScript(op, openKey = PS_OPEN[op]) {
   return `$ErrorActionPreference = 'Stop'
 try {
 ${openKey}
@@ -116,34 +120,44 @@ exit 0
 `;
 }
 
-function expandVars(value, env) {
+const b64json = (o) => Buffer.from(JSON.stringify(o), 'utf8').toString('base64');
+
+export function expandVars(value, env) {
   return value.replace(/%([^%]+)%/g, (m, n) => getEnv(env, n) ?? m);
 }
 
-// Append `dir` to the user Path iff absent, keeping its kind (a new value is
-// REG_EXPAND_SZ, so `%VAR%` entries stay literal) and never truncating.
-// `runPs(script, input)` -> {code, stdout, stderr} runs a userPathScript.
-// Fails closed: a failed or unparseable read, or a kind other than
-// REG_SZ/REG_EXPAND_SZ, throws without writing, since writing would replace
-// a Path we could not read. Only an absent value counts as empty.
-export async function addToUserPath(dir, { runPs, env = process.env }) {
-  const q = await runPs(userPathScript('read'), '');
-  if (q.code !== 0) throw new Error(`reading the user Path failed (exit ${q.code}): ${(q.stderr || '').trim()}`);
+// The user environment value `name` -> {exists, kind, value} (value
+// unexpanded). `runPs(script, input)` -> {code, stdout, stderr} runs a
+// userEnvScript. Fails closed: a failed or unparseable read, or a kind other
+// than REG_SZ/REG_EXPAND_SZ, throws, so a caller never overwrites a value it
+// could not read. Only an absent value is {exists: false}.
+export async function readUserEnv(name, { runPs }) {
+  const q = await runPs(userEnvScript('read'), b64json({ name }));
+  if (q.code !== 0) throw new Error(`reading the user ${name} failed (exit ${q.code}): ${(q.stderr || '').trim()}`);
   const out = (q.stdout || '').trim();
   let cur = null;
   if (/^[A-Za-z0-9+/]+={0,2}$/.test(out)) {
     try { cur = JSON.parse(Buffer.from(out, 'base64').toString('utf8')); } catch { cur = null; }
   }
-  if (typeof cur?.exists !== 'boolean') throw new Error('reading the user Path succeeded but its output could not be parsed');
-  if (cur.exists && cur.kind !== 'String' && cur.kind !== 'ExpandString') throw new Error(`user Path has unexpected kind ${cur.kind}`);
-  if (cur.exists && typeof cur.value !== 'string') throw new Error('user Path read back as a non-string');
+  if (typeof cur?.exists !== 'boolean') throw new Error(`reading the user ${name} succeeded but its output could not be parsed`);
+  if (cur.exists && cur.kind !== 'String' && cur.kind !== 'ExpandString') throw new Error(`user ${name} has unexpected kind ${cur.kind}`);
+  if (cur.exists && typeof cur.value !== 'string') throw new Error(`user ${name} read back as a non-string`);
+  return cur;
+}
 
+export async function writeUserEnv(name, value, kind, { runPs }) {
+  const r = await runPs(userEnvScript('write'), b64json({ name, value, kind }));
+  if (r.code !== 0) throw new Error(`writing the user ${name} failed (exit ${r.code}): ${(r.stderr || '').trim()}`);
+}
+
+// Append `dir` to the user Path iff absent, keeping its kind (a new value is
+// REG_EXPAND_SZ, so `%VAR%` entries stay literal) and never truncating.
+export async function addToUserPath(dir, { runPs, env = process.env }) {
+  const cur = await readUserEnv('Path', { runPs });
   const entries = splitPath(cur.exists ? cur.value : '');
   const norm = (s) => s.toLowerCase().replace(/[\\/]+$/, '');
   const want = norm(dir);
   if (entries.some((e) => norm(e) === want || norm(expandVars(e, env)) === want)) return false;
-  const req = { value: [...entries, dir].join(';'), kind: cur.exists ? cur.kind : 'ExpandString' };
-  const r = await runPs(userPathScript('write'), Buffer.from(JSON.stringify(req), 'utf8').toString('base64'));
-  if (r.code !== 0) throw new Error(`writing the user Path failed (exit ${r.code}): ${(r.stderr || '').trim()}`);
+  await writeUserEnv('Path', [...entries, dir].join(';'), cur.exists ? cur.kind : 'ExpandString', { runPs });
   return true;
 }

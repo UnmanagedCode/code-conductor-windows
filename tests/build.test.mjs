@@ -4,42 +4,18 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { buildInstaller, satisfiesEngines, CONTRACT_URL, DEFAULT_SOURCE } from '../src/build.mjs';
+import { buildInstaller, DEFAULT_SOURCE } from '../src/build.mjs';
 import { makeZip } from './zip.mjs';
 
-const srcDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src');
-const git = (cwd, ...args) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8' }).trim();
+const repoDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+const srcDir = path.join(repoDir, 'src');
+const pkgVersion = JSON.parse(fs.readFileSync(path.join(repoDir, 'package.json'), 'utf8')).version;
 
-// A cc-shaped seed repo pushed to a bare origin.git (the build's --source),
-// a fake makensis and a cached pinned node zip.
+// A fake makensis that records argv; for installer.nsi it snapshots the
+// stage; it writes OUTFILE. Plus a cached pinned node zip.
 function setup() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-build-'));
-  const seed = path.join(root, 'seed');
-  const origin = path.join(root, 'origin.git');
-  fs.mkdirSync(path.join(seed, 'bin'), { recursive: true });
-  git(seed, '-c', 'init.defaultBranch=main', 'init', '-q');
-  git(seed, 'config', 'user.email', 't@t');
-  git(seed, 'config', 'user.name', 't');
-  const pkg = (extra = {}) => fs.writeFileSync(path.join(seed, 'package.json'),
-    JSON.stringify({ name: 'code-conductor', version: '3.2.1', engines: { node: '>=24' }, ...extra }) + '\n');
-  pkg();
-  fs.writeFileSync(path.join(seed, 'package-lock.json'), '{}\n');
-  fs.writeFileSync(path.join(seed, 'LICENSE'), 'license text\n');
-  fs.writeFileSync(path.join(seed, 'bin', 'windows-launch.mjs'), '// launcher\n');
-  const commit = (msg) => {
-    fs.appendFileSync(path.join(seed, 'f.txt'), `${msg}\n`);
-    git(seed, 'add', '-A');
-    git(seed, 'commit', '-q', '-m', msg);
-    return git(seed, 'rev-parse', 'HEAD');
-  };
-  commit('c1');
-  execFileSync('git', ['init', '-q', '--bare', '-b', 'main', origin]);
-  const push = (...refs) => git(seed, 'push', '-q', origin, ...refs);
-  push('main');
-
-  // fake makensis: records argv; for installer.nsi snapshots the stage; writes OUTFILE.
   const record = path.join(root, 'calls.jsonl');
   const fake = path.join(root, 'makensis');
   fs.writeFileSync(fake, `#!${process.execPath}
@@ -53,9 +29,8 @@ if (stage) {
   const walk = (d, p = '') => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? walk(path.join(d, e.name), p + e.name + '/') : [p + e.name]);
   entry.files = walk(stage);
   entry.launcherExe = fs.existsSync(path.join(stage, 'code-conductor.exe'));
-  entry.setup = fs.readFileSync(path.join(stage, 'setup.mjs'), 'utf8');
   entry.license = fs.readFileSync(path.join(stage, 'LICENSE'), 'utf8');
-  fs.cpSync(path.join(stage, 'cc.bundle'), ${JSON.stringify(path.join(root, 'seen.bundle'))});
+  entry.icon = fs.existsSync(def('ICON'));
 }
 fs.appendFileSync(${JSON.stringify(record)}, JSON.stringify(entry) + '\\n');
 fs.writeFileSync(def('OUTFILE'), 'MZ fake');
@@ -69,31 +44,28 @@ fs.writeFileSync(def('OUTFILE'), 'MZ fake');
   fs.writeFileSync(path.join(cacheDir, 'node-v24.21.0-win-x64.zip'), zip);
   const pins = { node: { version: '24.21.0', url: 'https://example.invalid/node-v24.21.0-win-x64.zip', sha256: sha } };
   return {
-    root, seed, origin, fake, zip, pins, cacheDir, outDir: path.join(root, 'out'), commit, push, pkg,
+    root, fake, zip, pins, cacheDir, outDir: path.join(root, 'out'),
     calls: () => fs.readFileSync(record, 'utf8').trim().split('\n').map((l) => JSON.parse(l)).filter((c) => c.argv[0] !== '--version'),
     ran: () => fs.existsSync(record),
-    bundleTip: (branch) => {
-      const clone = path.join(root, `clone-${crypto.randomUUID()}`);
-      execFileSync('git', ['clone', '-q', '--branch', branch, path.join(root, 'seen.bundle'), clone]);
-      return git(clone, 'rev-parse', 'HEAD');
-    },
     cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
   };
 }
 
 const opts = (t, extra = {}) => ({
-  source: t.origin, outDir: t.outDir, cacheDir: t.cacheDir, pins: t.pins, makensis: t.fake,
+  outDir: t.outDir, cacheDir: t.cacheDir, pins: t.pins, makensis: t.fake,
   log: () => {}, download: async () => assert.fail('cache should satisfy the pin'), ...extra,
 });
 const defines = (call) => Object.fromEntries(call.argv.filter((a) => a.startsWith('-D')).map((a) => [a.slice(2, a.indexOf('=')), a.slice(a.indexOf('=') + 1)]));
 
-test('happy path: bundle carries the resolved commit on the branch; stage has node/, LICENSE from the ref, this repo\'s setup.mjs; defines passed; launcher before installer', async () => {
+// Invariant: the installer is not tied to a cc commit: the exe is named by
+// this repo's version, the defines carry the GitHub source and main (and the
+// icon), none carries a commit sha, and the launcher is built before the installer.
+test('default build: exe named by the package version; defines have source/branch/icon and no commit', async () => {
   const t = setup();
   try {
-    const head = git(t.seed, 'rev-parse', 'HEAD');
     const r = await buildInstaller(opts(t));
-    assert.equal(r.commit, head);
-    assert.equal(r.outFile, path.join(t.outDir, `code-conductor-setup-3.2.1-${head.slice(0, 8)}.exe`));
+    assert.equal(r.version, pkgVersion);
+    assert.equal(r.outFile, path.join(t.outDir, `code-conductor-setup-${pkgVersion}.exe`));
     assert.ok(fs.existsSync(r.outFile));
 
     const [launcher, installer] = t.calls();
@@ -101,108 +73,66 @@ test('happy path: bundle carries the resolved commit on the branch; stage has no
     assert.equal(defines(launcher).LAUNCHER, 'bin\\windows-launch.mjs');
     assert.match(installer.argv.at(-1), /installer\.nsi$/);
     const defs = defines(installer);
-    assert.equal(defs.VERSION, '3.2.1');
-    assert.equal(defs.COMMIT, head.slice(0, 8));
+    assert.deepEqual(Object.keys(defs).sort(), ['BRANCH', 'ICON', 'LAUNCHER', 'OUTFILE', 'SOURCE', 'STAGE', 'VERSION']);
+    assert.equal(defs.VERSION, pkgVersion);
+    assert.equal(defs.SOURCE, DEFAULT_SOURCE);
     assert.equal(defs.BRANCH, 'main');
-    assert.equal(defs.REMOTE_URL, DEFAULT_SOURCE, 'origin is the GitHub default, not the build source');
     assert.equal(defs.LAUNCHER, 'bin\\windows-launch.mjs');
     assert.equal(defs.OUTFILE, r.outFile);
+    for (const [k, v] of Object.entries(defs)) {
+      if (k !== 'STAGE' && k !== 'OUTFILE') assert.doesNotMatch(v, /[0-9a-f]{8,}/, `${k} carries a sha-like value`);
+    }
+    assert.match(path.basename(r.outFile), /^code-conductor-setup-[\d.]+\.exe$/);
+  } finally { t.cleanup(); }
+});
 
-    for (const f of ['LICENSE', 'node/node.exe', 'node/node_modules/npm/bin/npm-cli.js', 'installer.nsi', 'launcher.nsi', 'setup.mjs', 'toolchain.mjs', 'pins.json', 'cc.bundle']) {
+// Invariant: the stage holds exactly what the installer embeds (every
+// shipped source file, the repo LICENSE, the icon, node/) and no cc bundle;
+// both makensis runs get the staged icon.
+test('stage: shipped files, repo LICENSE, icon and node/, no cc.bundle; both makensis runs get ICON', async () => {
+  const t = setup();
+  try {
+    await buildInstaller(opts(t));
+    const [launcher, installer] = t.calls();
+    for (const f of ['setup.mjs', 'toolchain.mjs', 'contract.mjs', 'projects.mjs', 'pins.json', 'installer.nsi', 'launcher.nsi', 'icon.ico', 'LICENSE', 'node/node.exe', 'node/node_modules/npm/bin/npm-cli.js']) {
       assert.ok(installer.files.includes(f), f);
     }
-    assert.equal(installer.license, 'license text\n', 'LICENSE comes from the cc ref');
-    assert.equal(installer.setup, fs.readFileSync(path.join(srcDir, 'setup.mjs'), 'utf8'), 'setup.mjs comes from this repo');
+    assert.equal(installer.files.includes('cc.bundle'), false);
+    assert.equal(installer.license, fs.readFileSync(path.join(repoDir, 'LICENSE'), 'utf8'));
     assert.equal(installer.launcherExe, true);
-    assert.equal(t.bundleTip('main'), head);
+    assert.equal(defines(launcher).ICON, defines(installer).ICON);
+    assert.match(defines(installer).ICON, /icon\.ico$/);
+    assert.equal(installer.icon, true);
   } finally { t.cleanup(); }
 });
 
-test('--ref as a tag and as a sha each resolve; --branch names the bundled branch', async () => {
+// Invariant: --source/--branch overrides reach the defines unchanged.
+test('--source and --branch overrides are baked in as SOURCE and BRANCH', async () => {
   const t = setup();
   try {
-    const c1 = git(t.seed, 'rev-parse', 'HEAD');
-    git(t.seed, 'tag', 'v0.2.0');
-    t.push('v0.2.0');
-    t.commit('c2');
-    t.push('main');
-    const r = await buildInstaller(opts(t, { ref: 'v0.2.0' }));
-    assert.equal(r.commit, c1);
-    assert.equal(t.bundleTip('main'), c1);
-
-    const r2 = await buildInstaller(opts(t, { ref: c1, branch: 'stable' }));
-    assert.equal(r2.commit, c1);
-    assert.equal(defines(t.calls().at(-1)).BRANCH, 'stable');
-    assert.equal(t.bundleTip('stable'), c1);
-  } finally { t.cleanup(); }
-});
-
-test('an unknown ref is refused before makensis runs', async () => {
-  const t = setup();
-  try {
-    await assert.rejects(buildInstaller(opts(t, { ref: 'no-such-ref' })), /ref "no-such-ref" is not a branch, tag or commit/);
-    assert.equal(t.ran(), false);
-  } finally { t.cleanup(); }
-});
-
-test('a ref without bin/windows-launch.mjs is refused, citing the contract', async () => {
-  const t = setup();
-  try {
-    git(t.seed, 'rm', '-q', 'bin/windows-launch.mjs');
-    t.commit('drop launcher');
-    t.push('main');
-    const err = await buildInstaller(opts(t)).then(() => assert.fail('built'), (e) => e);
-    assert.match(err.message, /bin\/windows-launch\.mjs is missing/);
-    assert.ok(err.message.includes(CONTRACT_URL));
-    assert.equal(t.ran(), false);
-  } finally { t.cleanup(); }
-});
-
-test('engines.node the pinned Node does not satisfy, or in an unreadable form, is refused', async () => {
-  for (const [node, re] of [['>=99', /pinned Node 24\.21\.0 does not satisfy engines\.node ">=99"/], ['^24', /not of the form >=N\[\.N\[\.N\]\]/]]) {
-    const t = setup();
-    try {
-      t.pkg({ engines: { node } });
-      t.commit('engines');
-      t.push('main');
-      const err = await buildInstaller(opts(t)).then(() => assert.fail('built'), (e) => e);
-      assert.match(err.message, re);
-      assert.ok(err.message.includes(CONTRACT_URL));
-    } finally { t.cleanup(); }
-  }
-});
-
-test('a lockfile with an install script is refused, citing the contract', async () => {
-  const t = setup();
-  try {
-    fs.writeFileSync(path.join(t.seed, 'package-lock.json'), JSON.stringify({
-      lockfileVersion: 3,
-      packages: { '': { name: 'code-conductor' }, 'node_modules/ok': { version: '1.0.0' }, 'node_modules/native': { version: '1.0.0', hasInstallScript: true } },
-    }));
-    t.commit('native dep');
-    t.push('main');
-    const err = await buildInstaller(opts(t)).then(() => assert.fail('built'), (e) => e);
-    assert.match(err.message, /package-lock\.json has packages with install scripts: node_modules\/native$/m);
-    assert.ok(err.message.includes(CONTRACT_URL));
-    assert.equal(t.ran(), false);
-  } finally { t.cleanup(); }
-});
-
-test('a commit off the branch warns that self-update will report ahead or diverged', async () => {
-  const t = setup();
-  try {
-    git(t.seed, 'checkout', '-q', '-b', 'feature');
-    t.commit('f1');
-    t.push('feature');
     const lines = [];
-    await buildInstaller(opts(t, { ref: 'feature', log: (m) => lines.push(m) }));
-    assert.ok(lines.some((l) => /warning: .* not contained in main/.test(l)), lines.join('\n'));
-    const quiet = [];
-    await buildInstaller(opts(t, { log: (m) => quiet.push(m) }));
-    assert.equal(quiet.some((l) => /warning/.test(l)), false);
+    await buildInstaller(opts(t, { source: '/tmp/cc-checkout', branch: 'stable', log: (m) => lines.push(m) }));
+    const defs = defines(t.calls().at(-1));
+    assert.equal(defs.SOURCE, '/tmp/cc-checkout');
+    assert.equal(defs.BRANCH, 'stable');
+    assert.ok(lines.some((l) => l.includes('stable from /tmp/cc-checkout')), lines.join('\n'));
   } finally { t.cleanup(); }
 });
 
+// Invariant: a source or branch that would break the makensis command line
+// (empty, a double quote, whitespace) is refused before makensis runs.
+test('a quote, whitespace or empty source/branch is refused before makensis runs', async () => {
+  const t = setup();
+  try {
+    for (const bad of [{ source: 'a b' }, { source: 'a"b' }, { source: '' }, { branch: 'x y' }, { branch: 'x"' }, { branch: '' }]) {
+      await assert.rejects(buildInstaller(opts(t, bad)), /must be non-empty and contain no whitespace or double quote/, JSON.stringify(bad));
+    }
+    assert.equal(t.ran(), false);
+  } finally { t.cleanup(); }
+});
+
+// Invariant: a cached pinned zip with the wrong sha is re-downloaded and a
+// download that still mismatches is refused, before makensis runs.
 test('a cached zip with the wrong sha is re-downloaded; a download that still mismatches is refused', async () => {
   const t = setup();
   try {
@@ -218,11 +148,13 @@ test('a cached zip with the wrong sha is re-downloaded; a download that still mi
   } finally { t.cleanup(); }
 });
 
-test('satisfiesEngines: >=N[.N[.N]] compared numerically; other forms unreadable', () => {
-  assert.equal(satisfiesEngines('24.21.0', '>=24'), true);
-  assert.equal(satisfiesEngines('24.21.0', '>= 24.21'), true);
-  assert.equal(satisfiesEngines('24.21.0', '>=24.21.1'), false);
-  assert.equal(satisfiesEngines('24.9.0', '>=24.10'), false);
-  assert.equal(satisfiesEngines('25.0.0', '>=24.99.99'), true);
-  assert.equal(satisfiesEngines('24.21.0', '^24'), null);
+// Invariant: src/icon.ico is a real multi-size ICO (reserved 0, type 1) that
+// carries the sizes Windows asks for: 16, 32, 48 and 256 px (width byte 0).
+test('src/icon.ico parses as an ICO with 16, 32, 48 and 256 px entries', () => {
+  const ico = fs.readFileSync(path.join(srcDir, 'icon.ico'));
+  assert.equal(ico.readUInt16LE(0), 0);
+  assert.equal(ico.readUInt16LE(2), 1);
+  const count = ico.readUInt16LE(4);
+  const widths = Array.from({ length: count }, (_, i) => ico[6 + i * 16] || 256);
+  for (const w of [16, 32, 48, 256]) assert.ok(widths.includes(w), `${w}px in ${widths}`);
 });

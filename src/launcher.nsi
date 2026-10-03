@@ -1,12 +1,13 @@
 ; Start-menu stub: a GUI-subsystem exe (no console flash) that runs the
 ; bundled node on cc's launcher, which holds all launcher logic. It only knows
 ; two paths relative to itself. On failure it shows the launcher's output.
-; Built by build.mjs: makensis -DOUTFILE=<path> -DLAUNCHER=<path in the checkout> launcher.nsi
+; Built by build.mjs: makensis -DOUTFILE=<path> -DLAUNCHER=<path in the checkout> -DICON=<ico> launcher.nsi
 ; The launcher's path and exit codes are cc's installer contract:
 ; https://github.com/UnmanagedCode/code-conductor/blob/main/docs/windows.md#installer-contract
 Unicode true
 Name "code-conductor"
 OutFile "${OUTFILE}"
+Icon "${ICON}"
 RequestExecutionLevel user
 SilentInstall silent
 ShowInstDetails nevershow
