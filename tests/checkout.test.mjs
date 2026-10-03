@@ -308,3 +308,145 @@ test('network git commands run with GIT_TERMINAL_PROMPT=0 and GCM_INTERACTIVE=ne
     for (const l of net) assert.match(l, / 0 never$/);
   } finally { t.cleanup(); }
 });
+
+// A checkout whose commits (two on a feature branch, one on main, merged with
+// a merge commit) all exist on origin's main as rebased copies, the way an
+// older installer's bundled feature-branch tip ended up after the branch was
+// rebased onto main and merged. Run after `checkout(t.args())`. `ownChange`
+// puts a hand-made edit into the merge; `upstreamFile` is what the tip's
+// extra commit touches. Returns {head, tip}.
+function rebased(t, { upstreamFile = 'f.txt', ownChange = false } = {}) {
+  const inDir = (...a) => execFileSync('git', ['-C', t.dir, ...a], { encoding: 'utf8', env: t.env }).trim();
+  inDir('checkout', '-q', '-b', 'feat');
+  const a = commitIn(t, 'a', 'a.txt');
+  const b = commitIn(t, 'b', 'b.txt');
+  inDir('checkout', '-q', 'main');
+  const c = commitIn(t, 'c', 'c.txt');
+  if (ownChange) {
+    inDir('merge', '-q', '--no-commit', '--no-ff', 'feat');
+    fs.appendFileSync(path.join(t.dir, 'c.txt'), 'by hand\n');
+    inDir('add', '-A');
+    inDir('commit', '-q', '-m', 'merge feat');
+  } else {
+    inDir('merge', '-q', '--no-ff', '-m', 'merge feat', 'feat');
+  }
+  const head = inDir('rev-parse', 'HEAD');
+  t.commit('u1', upstreamFile);
+  git(t.seed, 'fetch', '-q', t.dir, 'feat', 'main');
+  git(t.seed, 'cherry-pick', a, b, c);
+  git(t.seed, 'push', '-q', '-f', t.origin, 'main');
+  return { head, tip: git(t.seed, 'rev-parse', 'HEAD') };
+}
+
+// Invariant: a diverged checkout whose off-tip commits (merges included) all
+// have rebased copies on the latest main is moved to it in place: branch,
+// upstream and untracked files are kept, and the move is logged.
+test('a diverged checkout whose commits are all on the latest main as rebased copies is moved to it', async () => {
+  const t = setup();
+  try {
+    await checkout(t.args());
+    const { head, tip } = rebased(t);
+    // the seed holds both histories (the checkout has not fetched the tip yet)
+    assert.ok(!git(t.seed, 'cherry', tip, head).includes('+'));
+    assert.equal(git(t.seed, 'rev-list', '--merges', `${tip}..${head}`).split('\n').length, 1);
+    fs.writeFileSync(path.join(t.dir, 'notes.txt'), 'mine\n');
+    t.lines.length = 0;
+    const r = await checkout(t.args());
+    assert.equal(git(t.dir, 'rev-parse', 'HEAD'), tip);
+    assert.equal(r.commit, tip);
+    assert.equal(git(t.dir, 'rev-parse', '--abbrev-ref', 'HEAD'), 'main');
+    assert.equal(git(t.dir, 'rev-parse', '--abbrev-ref', '@{u}'), 'origin/main');
+    assert.equal(fs.readFileSync(path.join(t.dir, 'notes.txt'), 'utf8'), 'mine\n');
+    assert.ok(t.lines.some((l) => l.includes(`moving ${head.slice(0, 8)} -> ${tip.slice(0, 8)}`) && /rebased/.test(l)), t.lines.join('\n'));
+    assert.ok(t.lines.some((l) => l.startsWith('checkout: installed cc ')), t.lines.join('\n'));
+  } finally { t.cleanup(); }
+});
+
+// Invariant: one commit with no patch-equivalent on the latest main keeps the
+// checkout diverged: it fails as before, names the commit in the log, and
+// leaves HEAD and the git config untouched.
+test('a rebased checkout with one genuine extra commit still fails as diverged', async () => {
+  const t = setup();
+  try {
+    await checkout(t.args());
+    const { head, tip } = rebased(t);
+    const mine = commitIn(t, 'mine', 'mine.txt');
+    const before = config(t);
+    t.lines.length = 0;
+    const err = await checkout(t.args()).then(() => assert.fail('moved'), (e) => e);
+    assert.match(err.message, /has diverged/);
+    assert.ok(err.message.includes(mine.slice(0, 8)) && err.message.includes(tip.slice(0, 8)), err.message);
+    assert.match(err.message, /uninstall code-conductor .*then run this installer again/);
+    assert.equal(git(t.dir, 'rev-parse', 'HEAD'), mine);
+    assert.notEqual(mine, head);
+    assert.deepEqual(config(t), before);
+    assert.ok(t.lines.some((l) => l.includes('commits not on it:') && l.includes(mine.slice(0, 8))), t.lines.join('\n'));
+  } finally { t.cleanup(); }
+});
+
+// Invariant: a merge whose recorded tree differs from re-merging its parents
+// holds hand-made changes that git cherry cannot see, so it is not moved.
+test('a rebased checkout whose merge has changes of its own fails as diverged', async () => {
+  const t = setup();
+  try {
+    await checkout(t.args());
+    const { head } = rebased(t, { ownChange: true });
+    t.lines.length = 0;
+    await assert.rejects(checkout(t.args()), /has diverged/);
+    assert.match(t.lines.join('\n'), /merge [0-9a-f]{8} has changes of its own/);
+    assert.equal(git(t.dir, 'rev-parse', 'HEAD'), head);
+  } finally { t.cleanup(); }
+});
+
+// Invariant: uncommitted edits to tracked files are never carried to another
+// base: a dirty rebased checkout fails as diverged with the edit, HEAD and
+// the git config intact.
+test('a dirty rebased checkout is not moved and fails as diverged', async () => {
+  const t = setup();
+  try {
+    await checkout(t.args());
+    const { head } = rebased(t);
+    fs.appendFileSync(path.join(t.dir, 'a.txt'), 'wip\n');
+    const before = config(t);
+    t.lines.length = 0;
+    await assert.rejects(checkout(t.args()), /has diverged/);
+    assert.match(fs.readFileSync(path.join(t.dir, 'a.txt'), 'utf8'), /wip\n$/);
+    assert.equal(git(t.dir, 'rev-parse', 'HEAD'), head);
+    assert.deepEqual(config(t), before);
+    assert.ok(t.lines.some((l) => l.includes('uncommitted changes')), t.lines.join('\n'));
+  } finally { t.cleanup(); }
+});
+
+// Invariant: an untracked file at a path the tip tracks blocks the move
+// (reset --keep refuses rather than overwrite it): the file's content and HEAD
+// are intact and setup fails as diverged.
+test('an untracked file in the tip\'s way blocks the move', async () => {
+  const t = setup();
+  try {
+    await checkout(t.args());
+    const { head } = rebased(t, { upstreamFile: 'new.txt' });
+    fs.writeFileSync(path.join(t.dir, 'new.txt'), 'precious\n');
+    t.lines.length = 0;
+    await assert.rejects(checkout(t.args()), /has diverged/);
+    assert.equal(fs.readFileSync(path.join(t.dir, 'new.txt'), 'utf8'), 'precious\n');
+    assert.equal(git(t.dir, 'rev-parse', 'HEAD'), head);
+    assert.match(t.lines.join('\n'), /NOT moved/);
+  } finally { t.cleanup(); }
+});
+
+// Invariant: a recoverable checkout is not moved to a tip that fails the
+// contract: HEAD is kept with a warning and the install continues.
+test('a rebased checkout behind a tip that fails the contract keeps HEAD, warns, and continues', async () => {
+  const t = setup();
+  try {
+    await checkout(t.args());
+    const { head } = rebased(t);
+    fs.writeFileSync(path.join(t.seed, 'package.json'), '{"name":"code-conductor","version":"2.0.0","engines":{"node":">=99"}}\n');
+    const tip = t.commit('needs a newer node');
+    t.lines.length = 0;
+    const r = await checkout(t.args());
+    assert.deepEqual(r, { commit: head, version: '1.0.0' });
+    assert.equal(git(t.dir, 'rev-parse', 'HEAD'), head);
+    assert.ok(t.lines.some((l) => l.includes(`the latest main ${tip.slice(0, 8)} does not meet the installer contract; kept ${head.slice(0, 8)}`)), t.lines.join('\n'));
+  } finally { t.cleanup(); }
+});
