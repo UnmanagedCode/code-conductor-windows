@@ -340,7 +340,8 @@ function rebased(t, { upstreamFile = 'f.txt', ownChange = false } = {}) {
 
 // Invariant: a diverged checkout whose off-tip commits (merges included) all
 // have rebased copies on the latest main is moved to it in place: branch,
-// upstream and untracked files are kept, and the move is logged.
+// upstream and untracked files are kept, the old HEAD is kept as the
+// pre-install/<sha8> branch, and the move (naming that branch) is logged.
 test('a diverged checkout whose commits are all on the latest main as rebased copies is moved to it', async () => {
   const t = setup();
   try {
@@ -357,7 +358,8 @@ test('a diverged checkout whose commits are all on the latest main as rebased co
     assert.equal(git(t.dir, 'rev-parse', '--abbrev-ref', 'HEAD'), 'main');
     assert.equal(git(t.dir, 'rev-parse', '--abbrev-ref', '@{u}'), 'origin/main');
     assert.equal(fs.readFileSync(path.join(t.dir, 'notes.txt'), 'utf8'), 'mine\n');
-    assert.ok(t.lines.some((l) => l.includes(`moving ${head.slice(0, 8)} -> ${tip.slice(0, 8)}`) && /rebased/.test(l)), t.lines.join('\n'));
+    assert.equal(git(t.dir, 'rev-parse', `pre-install/${head.slice(0, 8)}`), head);
+    assert.ok(t.lines.some((l) => l.includes(`moving ${head.slice(0, 8)} -> ${tip.slice(0, 8)}`) && l.includes(`pre-install/${head.slice(0, 8)}`)), t.lines.join('\n'));
     assert.ok(t.lines.some((l) => l.startsWith('checkout: installed cc ')), t.lines.join('\n'));
   } finally { t.cleanup(); }
 });
@@ -448,5 +450,78 @@ test('a rebased checkout behind a tip that fails the contract keeps HEAD, warns,
     assert.deepEqual(r, { commit: head, version: '1.0.0' });
     assert.equal(git(t.dir, 'rev-parse', 'HEAD'), head);
     assert.ok(t.lines.some((l) => l.includes(`the latest main ${tip.slice(0, 8)} does not meet the installer contract; kept ${head.slice(0, 8)}`)), t.lines.join('\n'));
+  } finally { t.cleanup(); }
+});
+
+// Invariant: patch-equivalence is the rule, not content survival: a local
+// commit whose patch upstream applied and later reverted is still moved (the
+// content leaves the tree), and the pre-install branch then holds it.
+test('a commit whose patch upstream applied and reverted is moved, and the backup branch holds it', async () => {
+  const t = setup();
+  try {
+    await checkout(t.args());
+    const x = commitIn(t, 'x', 'x.txt');
+    // the same patch as the local commit, under another message (so another sha)
+    fs.writeFileSync(path.join(t.seed, 'x.txt'), 'x\n');
+    git(t.seed, 'add', '-A');
+    git(t.seed, 'commit', '-q', '-m', 'y');
+    git(t.seed, 'rm', '-q', 'x.txt');
+    git(t.seed, 'commit', '-q', '-m', 'revert y');
+    git(t.seed, 'push', '-q', '-f', t.origin, 'main');
+    const tip = git(t.seed, 'rev-parse', 'HEAD');
+    await checkout(t.args());
+    assert.equal(git(t.dir, 'rev-parse', 'HEAD'), tip);
+    assert.ok(!fs.existsSync(path.join(t.dir, 'x.txt')));
+    assert.equal(git(t.dir, 'rev-parse', `pre-install/${x.slice(0, 8)}`), x);
+    assert.equal(git(t.dir, 'show', `pre-install/${x.slice(0, 8)}:x.txt`), 'x');
+  } finally { t.cleanup(); }
+});
+
+// Invariant: recovery never rewrites another branch: HEAD on a branch other
+// than the installed one fails as diverged, naming the branch, HEAD unchanged.
+test('a rebased checkout on another branch is not moved and fails as diverged', async () => {
+  const t = setup();
+  try {
+    await checkout(t.args());
+    const { head } = rebased(t);
+    git(t.dir, 'checkout', '-q', '-b', 'other');
+    t.lines.length = 0;
+    await assert.rejects(checkout(t.args()), /has diverged/);
+    assert.match(t.lines.join('\n'), /on branch other, not main/);
+    assert.equal(git(t.dir, 'rev-parse', 'HEAD'), head);
+    assert.equal(git(t.dir, 'rev-parse', 'main'), head);
+  } finally { t.cleanup(); }
+});
+
+// Invariant: an existing pre-install/<sha8> at another commit stops the move
+// (nothing is overwritten): fails as diverged, HEAD unchanged.
+test('a pre-install branch at another commit blocks the move', async () => {
+  const t = setup();
+  try {
+    await checkout(t.args());
+    const { head } = rebased(t);
+    git(t.dir, 'branch', `pre-install/${head.slice(0, 8)}`, 'HEAD~1');
+    t.lines.length = 0;
+    await assert.rejects(checkout(t.args()), /has diverged/);
+    assert.match(t.lines.join('\n'), /already exists at another commit/);
+    assert.equal(git(t.dir, 'rev-parse', 'HEAD'), head);
+  } finally { t.cleanup(); }
+});
+
+// Invariant: a git failure while judging recoverability is a not-recoverable
+// reason (the standard diverged error), not a bare throw.
+test('a git failure while judging recoverability gives the diverged error', async () => {
+  const t = setup();
+  try {
+    await checkout(t.args());
+    const { head } = rebased(t);
+    const real = t.args();
+    // fail `git cherry` only
+    const wrapper = path.join(t.root, 'git-wrap.sh');
+    fs.writeFileSync(wrapper, '#!/bin/sh\n[ "$1" = cherry ] && exit 3\nexec git "$@"\n', { mode: 0o755 });
+    t.lines.length = 0;
+    await assert.rejects(checkout({ ...real, git: wrapper }), /has diverged/);
+    assert.match(t.lines.join('\n'), /git cherry failed \(exit 3\)/);
+    assert.equal(git(t.dir, 'rev-parse', 'HEAD'), head);
   } finally { t.cleanup(); }
 });
