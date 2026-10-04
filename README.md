@@ -1,6 +1,6 @@
 # code-conductor-windows
 
-The per-user Windows installer for [code-conductor](https://github.com/UnmanagedCode/code-conductor) (cc). It is a single `code-conductor-setup-<version>.exe` that installs the latest cc `main` from GitHub at install time, for the current Windows user, with no admin rights. That covers a bundled Node, a git checkout that cc's in-app self-update keeps current, Git for Windows and Claude Code (if missing), a projects folder of your choice and a Start-menu entry and a desktop shortcut. The exe is built on Linux and is not tied to a cc commit.
+The per-user Windows installer for [code-conductor](https://github.com/UnmanagedCode/code-conductor) (cc). It is a single `code-conductor-setup-<version>.exe` that installs the latest cc `main` from GitHub at install time, for the current Windows user, with no admin rights. That covers a bundled Node, a git checkout that cc's in-app self-update keeps current, Git for Windows and Claude Code (if missing), a projects folder and port of your choice and a Start-menu entry and a desktop shortcut. The exe is built on Linux and is not tied to a cc commit.
 
 What this installer relies on from cc (launcher path and exit codes, install layout, checkout recipe, tool locations, projects root) is cc's **installer contract**: [▶ cc docs/windows.md#installer-contract](https://github.com/UnmanagedCode/code-conductor/blob/main/docs/windows.md#installer-contract). This README does not restate it.
 
@@ -8,11 +8,13 @@ What this installer relies on from cc (launcher path and exit codes, install lay
 
 Run `code-conductor-setup-<version>.exe` as the user who will use cc. It needs network access to GitHub and the npm registry. The installer:
 
-1. Stops a running cc first, after asking (through the launcher's `--status`/`--stop`, whose results also go to `logs\setup.log`). It aborts if something answers on cc's port but can't be identified. If the existing `app\` has no launcher and something answers `/api/health`, it aborts rather than removing `node\` under a running server.
+1. Stops a running cc first, after asking (through the launcher's `--status`/`--stop`, whose results also go to `logs\setup.log`). It aborts if something answers on cc's current port (the stored one, else an inherited `PORT`, else 8787) but can't be identified. If the existing `app\` has no launcher and something answers `/api/health`, it aborts rather than removing `node\` under a running server.
 2. Replaces `node\` with the bundled Node.
 3. Asks for the **projects folder** (a directory page). The default is the existing user `PROJECTS_ROOT`, else an inherited `PROJECTS_ROOT`, else `%USERPROFILE%\code-conductor`. Silent installs take `/PROJECTS=<dir>`, which wins over all of those. Accepted forms: `/S /PROJECTS="D:\My projects"`, a whole-token quote as PowerShell passes it (`"/PROJECTS=D:\My projects"`), and an unquoted path without spaces, where `/` works as `\` (`/PROJECTS=D:/x`). A `/PROJECTS=` with no folder aborts the installer instead of falling back to another folder. A drive root (`D:\`) is accepted. `/NODESKTOP` skips the desktop shortcut and, on a re-install, removes an existing one; it is accepted as `/NODESKTOP` or `"/NODESKTOP"`, as a whole token in any case. Without it a silent install creates the shortcut.
-4. Runs `setup.mjs` with that Node. Progress goes to the details pane and `logs\setup.log`:
+4. Asks for the **port** cc listens on (a custom page). The default is the stored `HKCU\Software\code-conductor` `Port`, else an inherited `PORT`, else 8787. Silent installs take `/PORT=<n>`, which wins over those, in the same forms as `/PROJECTS=` (one shared parser): `/PORT=9000`, `/PORT="9000"`, `"/PORT=9000"`. A `/PORT=` with no number aborts the installer. The page refuses only an empty field; the range is checked by setup.
+5. Runs `setup.mjs` with that Node. Progress goes to the details pane and `logs\setup.log`:
    - **Projects folder (validated first, before any download):** it must be an absolute path (drive letter or UNC) that is not the install directory or inside it (uninstall deletes that), and not an existing file.
+   - **Port (validated before any download):** a whole number from 1 to 65535 in canonical form (no sign, no leading zero; `checkPort` in `src/port.mjs`). A port that cannot be bound on `127.0.0.1` at install time (in use, or in a Windows reserved range) only logs a warning in `setup.log`; ports below 1024 get none.
    - **Git for Windows:** uses an existing Git that has Git Bash (`git.exe` in `<root>\cmd` or `<root>\bin`, plus `<root>\bin\bash.exe`), found on PATH, in `%LOCALAPPDATA%\Programs\Git` or in `%ProgramFiles%\Git`. A `git.exe` in `usr\bin`, `mingw64\bin` or `mingw32\bin` (Git's "optional Unix tools" PATH option) does not count. Setup uses the install's own `cmd\git.exe` (else `bin\git.exe`). Otherwise it downloads the pinned Git installer, checks its sha256 and installs it per-user (`/CURRENTUSER`, Git's `cmd` on PATH).
    - **Claude Code:** uses `claude.exe` on PATH (an npm `.cmd` shim does not count) or `%USERPROFILE%\.local\bin\claude.exe`. Otherwise it runs the official installer (`irm https://claude.ai/install.ps1 | iex`).
    - **User PATH:** appends `%USERPROFILE%\.local\bin` to the user `Path` (`HKCU\Environment`) if it is absent, keeping the existing entries, any `%VAR%` in them, non-ASCII characters and the value's kind (a new value is `REG_EXPAND_SZ`). It reads and writes through PowerShell's .NET registry API, not `reg.exe`, whose output is in the console code page. A Path it cannot read, or of a kind other than `REG_SZ`/`REG_EXPAND_SZ`, aborts setup rather than being overwritten.
@@ -41,7 +43,7 @@ Run `code-conductor-setup-<version>.exe` as the user who will use cc. It needs n
      A fresh install has nothing usable to fall back on. An existing one keeps working, and refusing it would also block a re-run to repair Node, Git or Claude Code. A failing checkout keeps its git config: `origin` and `core.autocrlf` are set only after these checks pass. A diverged checkout that fails holds work of its own, and uninstalling removes `app\` with it: save that work first, e.g. `git -C "%LOCALAPPDATA%\Programs\code-conductor\app" format-patch <latest main>..HEAD`, or push it elsewhere. After a move the old commit lives only on the `pre-install/<sha8>` branch in `app\`, which uninstalling deletes: save it first, e.g. `git -C "%LOCALAPPDATA%\Programs\code-conductor\app" format-patch <latest main>..pre-install/<sha8>`, or push that branch somewhere. Then uninstall and run the installer again; your projects folder is kept. The installed commit is logged: `checkout: installed cc <version> at <sha> (<branch> from <source>)`.
    - **Dependencies:** `npm ci` in `app\` with the bundled Node and npm.
    - **Projects:** creates the folder and saves it as the user environment variable `PROJECTS_ROOT` (`HKCU\Environment`, which cc's launcher honours), through the same PowerShell channel as the Path. It writes only when the folder differs from what the launcher would already use (the user value, else an inherited one, else the default), so a default install leaves the registry alone and an existing `%VAR%` form is kept. A value of a kind other than `REG_SZ`/`REG_EXPAND_SZ` aborts setup rather than being overwritten.
-5. Only if setup succeeded: writes `code-conductor.exe` (the Start-menu stub), `uninstall.exe`, the Start-menu shortcut, the desktop shortcut (silent installs: unless `/NODESKTOP`) and the Apps & features entry (`DisplayVersion` = the installer's version), sets `PROJECTS_ROOT` in the installer's own environment so the finish page's Launch uses the chosen folder, and shows the finish page. A failed setup aborts the installer (exit code 2 when silent) and points at `logs\setup.log`.
+6. Only if setup succeeded: writes `code-conductor.exe` (the Start-menu stub), `uninstall.exe`, the Start-menu shortcut, the desktop shortcut (silent installs: unless `/NODESKTOP`) and the Apps & features entry (`DisplayVersion` = the installer's version), writes `HKCU\Software\code-conductor` `Port` only when it differs from what cc already runs on (a default install leaves the registry alone; a failed setup writes nothing, so cc keeps its old port), sets `PROJECTS_ROOT` and `PORT` in the installer's own environment so the finish page's Launch uses the chosen folder and port, and shows the finish page, which names `http://127.0.0.1:<port>/`. A failed setup aborts the installer (exit code 2 when silent) and points at `logs\setup.log`.
 
 The finish page offers to launch cc and to create a desktop shortcut (ticked; unticked when `/NODESKTOP` was given). Unticking it on a re-install removes an existing desktop shortcut. Sign in to Claude once with `claude auth login` in a terminal if you haven't already. Your projects live in the folder you chose.
 
@@ -58,7 +60,7 @@ The finish page offers to launch cc and to create a desktop shortcut (ticked; un
 
 ### Launcher
 
-`code-conductor.exe` is a windowless stub that runs cc's own launcher, `app\bin\windows-launch.mjs`, with the bundled Node. The launcher ships in the cc checkout and updates with it. It reuses a running cc, or starts the server and opens the UI; on failure the stub shows its message in a message box. The launcher's modes, server environment and logs are documented in [cc docs/windows.md](https://github.com/UnmanagedCode/code-conductor/blob/main/docs/windows.md#launcher).
+`code-conductor.exe` is a windowless stub that runs cc's own launcher, `app\bin\windows-launch.mjs`, with the bundled Node, after setting `PORT` from the stored `Port` (`UseStoredPort` in `src/port.nsh`); the Start menu, desktop shortcut and finish page's Launch all go through it. A hand-run `node app\bin\windows-launch.mjs` does not read the registry: it uses `PORT` if set, else 8787. The launcher ships in the cc checkout and updates with it. It reuses a running cc, or starts the server and opens the UI; on failure the stub shows its message in a message box. The launcher's modes, server environment and logs are documented in [cc docs/windows.md](https://github.com/UnmanagedCode/code-conductor/blob/main/docs/windows.md#launcher).
 
 ### Update
 
@@ -71,7 +73,7 @@ In-app self-update moves only `app\`. The bundled `node\` stays at the version t
 
 ### Uninstall
 
-Apps & features → code-conductor, or `uninstall.exe` (`/S` for silent). It stops a running cc, then removes the install directory, the Start-menu and desktop shortcuts and the Apps & features entry. It **keeps** your projects folder (and its `.code-conductor` store), the user `PROJECTS_ROOT` variable naming it (so a re-install finds the same projects), Git for Windows, Claude Code and the user PATH entry.
+Apps & features → code-conductor, or `uninstall.exe` (`/S` for silent). It stops a running cc, then removes the install directory, the Start-menu and desktop shortcuts and the Apps & features entry. It **keeps** your projects folder (and its `.code-conductor` store), the user `PROJECTS_ROOT` variable naming it (so a re-install finds the same projects), the `HKCU\Software\code-conductor` `Port` value (so a re-install keeps the port), Git for Windows, Claude Code and the user PATH entry.
 
 ### Limitations
 
@@ -79,6 +81,9 @@ Apps & features → code-conductor, or `uninstall.exe` (`/S` for silent). It sto
 - Downloads (Git, Claude Code's installer) use Node's `fetch`, which ignores the system proxy; the cc clone/fetch uses Git's own proxy settings.
 - Installing needs network access to GitHub and the npm registry.
 - A projects folder chosen on a re-install does not move existing projects.
+- With a non-default port, `PORT` is in cc's server environment, so the Claude sessions cc starts, and the shells they run, inherit it. A project dev server that reads `PORT` will try cc's port and fail.
+- `/PORT=` is found by the same token rule as `/PROJECTS=`, so it can also match inside a quoted `/PROJECTS=` path (`/PROJECTS="D:\a /PORT=1"`); the stray value is refused by `checkPort`, not used.
+- The install-time port check is advisory: a socket just released, or a holder on `0.0.0.0`, can give a false or missed warning.
 - Signing in to Claude is manual: `claude auth login`.
 
 ## Technical
@@ -93,9 +98,11 @@ src/
   setup.mjs       install-time CLI the installer runs with the bundled Node
   contract.mjs    the installer-contract checks on a cc revision (used by setup.mjs)
   projects.mjs    projects-folder validation and the user PROJECTS_ROOT write (used by setup.mjs)
+  port.mjs        port validation and the install-time availability check (used by setup.mjs)
   toolchain.mjs   Git/claude detection and the user-environment channel (used by setup.mjs)
   icon.ico        the installer, uninstaller, stub and shortcut icon
   pins.json       pinned Node zip and Git for Windows installer (version, url, sha256)
+  port.nsh        the stored-port registry location, default and `UseStoredPort`, shared by the installer and the stub
   installer.nsi   installer + uninstaller
   launcher.nsi    Start-menu stub (code-conductor.exe)
 tests/            node:test suites; zip.mjs is a minimal zip writer for fixtures
@@ -167,10 +174,12 @@ $env:PWSH = 'powershell.exe'; node --test tests/userpath.pwsh.test.mjs   # in a 
 |---|---|
 | `tests/contract.test.mjs` | `contractProblems` over an in-memory revision: each missing file, unparseable JSON, install-script packages, `engines.node` forms, the contract URL in every message; `satisfiesEngines` |
 | `tests/projects.test.mjs` | `checkProjectsRoot` (relative, inside the install dir, file, UNC, trailing `\`) and `persistProjectsRoot` against a fake of the PowerShell channel (unchanged → no write, kind kept, Binary refused, non-ASCII) |
-| `tests/build.test.mjs` | `buildInstaller` with a fake `makensis`: version-named exe, the defines (no commit), the stage contents (no bundled cc checkout), `--source`/`--branch`, refused quote/whitespace, the pinned-zip cache, `icon.ico` structure |
+| `tests/port.test.mjs` | `checkPort` (canonical 1-65535 only), `warnIfPortTaken` against a real listening socket and injected results (free, `EACCES`, unknown code) |
+| `tests/nsis.test.mjs` | Static checks of `src/*.nsi`: the installer passes every flag in `REQUIRED_ARGS`; every module `setup.mjs` imports is staged; the stub and the uninstaller read the stored port before the launcher; both valued switches use `ParseValueSwitch` |
+| `tests/build.test.mjs` | `buildInstaller` with a fake `makensis`: version-named exe, the defines (no commit), the stage contents (including `port.mjs`, `port.nsh`; no bundled cc checkout), `--source`/`--branch`, refused quote/whitespace, the pinned-zip cache, `icon.ico` structure |
 | `tests/build.real.test.mjs` | Gated by `RUN_WIN_INSTALLER_BUILD=1`: the pinned Node download and real `makensis` produce a PE exe over 20 MB named by version only |
 | `tests/checkout.test.mjs` | `checkout()` with real git against a local origin: fresh clone (LF, upstream, origin, installed line); equal/behind/ahead/diverged; a diverged checkout whose commits (merges included) have patch-equivalents on the tip is moved to it, keeping branch, upstream and untracked files and saving the old `HEAD` as `pre-install/<sha8>` (also when upstream reverted the patch); another branch or an existing backup at another commit, a failing git check, a genuine commit, a merge with its own changes, a dirty tree or an untracked file in the way still fails as diverged; a contract-failing tip keeps `HEAD`; a dirty tree kept; contract failures (fresh removes `app\`, existing keeps `HEAD` and warns, a failing `HEAD` fails with config untouched); 3 attempts on an unreachable source; prompts disabled for clone/fetch |
-| `tests/checkout.real.test.mjs` | Gated by `RUN_REAL_CC_FETCH=1`: a real `checkout()` of GitHub `main` with the pinned Node, proving current cc `main` passes the install-time contract |
-| `tests/setup.test.mjs` | `ensureGit` sha refusal, `downloadWithRetry` |
+| `tests/checkout.real.test.mjs` | Gated by `RUN_REAL_CC_FETCH=1`: a real `checkout()` of GitHub `main` with the pinned Node, proving current cc `main` passes the install-time contract; cc's launcher takes its port from an inherited `PORT` (`portOf`, `launcherEnv`) and defaults to `DEFAULT_PORT` from `port.nsh` |
+| `tests/setup.test.mjs` | `ensureGit` sha refusal, `downloadWithRetry`, `main` requiring `--port` and refusing a bad one before any download |
 | `tests/toolchain.test.mjs` | `detectGit` layouts (mirroring cc's C8, plus the rejected `usr\bin`/`mingw64\bin`), `detectClaude`, `findOnPath`, `addToUserPath`/`readUserEnv`/`writeUserEnv` against a fake of the PowerShell channel (base64 JSON both ways, addressed by value name, exit 1 with localized stderr, non-ASCII round-trip) |
 | `tests/userpath.pwsh.test.mjs` | Gated by `PWSH`: the real user-environment scripts run by real PowerShell through `runPowerShell`, with `HKCU\Environment` swapped for a fake key, so the encoding path is exercised end to end (non-ASCII round-trip for Path and PROJECTS_ROOT, a multi-KB Path past the command-line limit, kinds, failure exit codes) |
