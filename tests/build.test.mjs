@@ -94,7 +94,7 @@ test('stage: shipped files, repo LICENSE, icon and node/, no cc.bundle; both mak
   try {
     await buildInstaller(opts(t));
     const [launcher, installer] = t.calls();
-    for (const f of ['setup.mjs', 'toolchain.mjs', 'contract.mjs', 'projects.mjs', 'pins.json', 'installer.nsi', 'launcher.nsi', 'icon.ico', 'LICENSE', 'node/node.exe', 'node/node_modules/npm/bin/npm-cli.js']) {
+    for (const f of ['setup.mjs', 'toolchain.mjs', 'contract.mjs', 'projects.mjs', 'port.mjs', 'port.nsh', 'pins.json', 'installer.nsi', 'launcher.nsi', 'icon.ico', 'LICENSE', 'node/node.exe', 'node/node_modules/npm/bin/npm-cli.js']) {
       assert.ok(installer.files.includes(f), f);
     }
     assert.equal(installer.files.includes('cc.bundle'), false);

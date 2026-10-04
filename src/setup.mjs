@@ -1,6 +1,6 @@
 // Install-time CLI, run by the installer with the bundled node:
-//   node setup.mjs --install-dir D --source URL --branch X --projects-root P
-// Validates the projects folder, ensures Git for Windows and claude, puts
+//   node setup.mjs --install-dir D --source URL --branch X --projects-root P --port N
+// Validates the projects folder and port (warning if the port is in use), ensures Git for Windows and claude, puts
 // claude's dir on the user PATH, clones/fast-forwards cc's latest <X> from URL
 // into <D>\app and checks it against the installer contract, runs `npm ci`,
 // and saves the projects folder as the user PROJECTS_ROOT.
@@ -15,6 +15,7 @@ import { pathToFileURL } from 'node:url';
 import { detectGit, detectClaude, addToUserPath, envKey, getEnv, splitPath } from './toolchain.mjs';
 import { contractProblems, contractError } from './contract.mjs';
 import { checkProjectsRoot, persistProjectsRoot } from './projects.mjs';
+import { checkPort, warnIfPortTaken } from './port.mjs';
 
 const w = path.win32;
 
@@ -308,10 +309,13 @@ export async function checkout({ git, source, dir, branch, nodeVersion, log, env
   return { commit, version };
 }
 
+// Every flag main requires; the installer must pass all of them.
+export const REQUIRED_ARGS = ['install-dir', 'source', 'branch', 'projects-root', 'port'];
+
 export async function main(argv, env = process.env) {
   const args = {};
   for (let i = 0; i < argv.length; i += 2) args[argv[i].replace(/^--/, '')] = argv[i + 1];
-  for (const k of ['install-dir', 'source', 'branch', 'projects-root']) {
+  for (const k of REQUIRED_ARGS) {
     if (!args[k]) throw new Error(`missing --${k}`);
   }
   const installDir = args['install-dir'];
@@ -319,6 +323,8 @@ export async function main(argv, env = process.env) {
   const pins = JSON.parse(fs.readFileSync(new URL('./pins.json', import.meta.url), 'utf8'));
   // Before any download: a bad folder should fail in seconds.
   const projectsRoot = checkProjectsRoot(args['projects-root'], installDir);
+  const port = checkPort(args.port);
+  await warnIfPortTaken(port, { log });
 
   const git = await ensureGit({ env, pin: pins.git, log });
   const claude = await ensureClaude({ env, log });

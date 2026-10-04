@@ -1,6 +1,7 @@
 ; Per-user installer + uninstaller. Built by build.mjs, which passes
 ; -DVERSION -DSOURCE -DBRANCH -DSTAGE -DOUTFILE -DLAUNCHER -DICON.
 ; /PROJECTS=<dir> sets the projects folder (also when silent).
+; /PORT=<n> sets the port cc listens on (also when silent).
 ; /NODESKTOP skips the desktop shortcut and removes an existing one (also when silent).
 ; What it relies on from cc (launcher path and exit codes, layout):
 ; https://github.com/UnmanagedCode/code-conductor/blob/main/docs/windows.md#installer-contract
@@ -11,6 +12,8 @@ Unicode true
 !include "FileFunc.nsh"
 !include "TextFunc.nsh"
 !include "WordFunc.nsh"
+!include "nsDialogs.nsh"
+!include "${__FILEDIR__}\port.nsh"
 !insertmacro WordReplace
 
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\code-conductor"
@@ -29,7 +32,7 @@ ShowInstDetails show
 !define MUI_FINISHPAGE_SHOWREADME ""
 !define MUI_FINISHPAGE_SHOWREADME_TEXT "Create a desktop shortcut"
 !define MUI_FINISHPAGE_SHOWREADME_FUNCTION CreateDesktopShortcut
-!define MUI_FINISHPAGE_TEXT "code-conductor is installed. Your projects live in $ProjectsRoot.$\r$\n$\r$\nIf you have not signed in to Claude yet, run $\"claude auth login$\" once in a terminal."
+!define MUI_FINISHPAGE_TEXT "code-conductor is installed. It runs at http://127.0.0.1:$Port/ and your projects live in $ProjectsRoot.$\r$\n$\r$\nIf you have not signed in to Claude yet, run $\"claude auth login$\" once in a terminal."
 
 ; Set only once every install step succeeded; the finish page ("installed",
 ; launch checkbox) is skipped otherwise.
@@ -37,6 +40,13 @@ Var InstallOk
 ; The projects folder: /PROJECTS=, else the user PROJECTS_ROOT, else the
 ; default (the launcher's own, which an inherited PROJECTS_ROOT overrides).
 Var ProjectsRoot
+; The port cc listens on: /PORT=, else $PortResolved. The wizard page edits it.
+Var Port
+; The port cc runs on now, as the launcher would resolve it: the stored port,
+; else an inherited PORT, else the default.
+Var PortResolved
+; The raw value ParseValueSwitch found.
+Var SwitchValue
 ; 1 when /NODESKTOP was given.
 Var NoDesktop
 
@@ -47,6 +57,7 @@ SpaceTexts none
 !define MUI_DIRECTORYPAGE_TEXT_DESTINATION "Projects folder"
 !define MUI_DIRECTORYPAGE_VARIABLE $ProjectsRoot
 !insertmacro MUI_PAGE_DIRECTORY
+Page custom PortPageShow PortPageLeave
 !insertmacro MUI_PAGE_INSTFILES
 !define MUI_PAGE_CUSTOMFUNCTION_PRE FinishPre
 !define MUI_PAGE_CUSTOMFUNCTION_SHOW FinishShow
@@ -68,24 +79,36 @@ SpaceTexts none
   ${EndIf}
 !macroend
 
-; Reads /PROJECTS= from $CMDLINE into $ProjectsRoot and sets $R9 to 1 when
-; the switch is present. GetOptions is not used: it misses the whole-token
-; quoted form and truncates at a second "/". Accepted forms:
+; The port as the launcher would resolve it, left in $PortResolved. Also
+; leaves PORT set in this process, so StopRunning reaches the running cc.
+!macro ResolvePort
+  !insertmacro UseStoredPort
+  ReadEnvStr $PortResolved PORT
+  ${If} $PortResolved == ""
+    StrCpy $PortResolved "${DEFAULT_PORT}"
+  ${EndIf}
+!macroend
+
+; Reads the switch whose text (e.g. /PORT=) is on the stack into $SwitchValue
+; and sets $R9 to 1 when it is present. GetOptions is not used: it misses the
+; whole-token quoted form and truncates at a second "/". Accepted forms:
 ;   /PROJECTS="D:\My projects"   /PROJECTS=D:/x   "/PROJECTS=D:\My projects"
 ; The switch must start a token (line start, after a space or a quote). A
 ; quoted value, or a whole-token quote, ends at the next quote; an unquoted
-; value ends at the next space. "/" in the value becomes "\".
-Function ParseProjectsSwitch
+; value ends at the next space.
+Function ParseValueSwitch
+  Pop $0
+  StrLen $1 $0
   StrCpy $R9 0
-  StrCpy $ProjectsRoot ""
+  StrCpy $SwitchValue ""
   StrLen $R0 $CMDLINE
   StrCpy $R1 0
   ${Do}
     ${If} $R1 >= $R0
       ${Break}
     ${EndIf}
-    StrCpy $R2 $CMDLINE 10 $R1
-    ${If} $R2 == "/PROJECTS="
+    StrCpy $R2 $CMDLINE $1 $R1
+    ${If} $R2 == $0
       StrCpy $R3 " "
       ${If} $R1 > 0
         IntOp $R4 $R1 - 1
@@ -94,7 +117,7 @@ Function ParseProjectsSwitch
       ${If} $R3 == " "
       ${OrIf} $R3 == '"'
         StrCpy $R9 1
-        IntOp $R5 $R1 + 10
+        IntOp $R5 $R1 + $1
         StrCpy $R6 $CMDLINE "" $R5
         ; $R7: the character that ends the value
         StrCpy $R7 " "
@@ -117,7 +140,7 @@ Function ParseProjectsSwitch
           ${If} $R4 == $R7
             ${Break}
           ${EndIf}
-          StrCpy $ProjectsRoot "$ProjectsRoot$R4"
+          StrCpy $SwitchValue "$SwitchValue$R4"
           IntOp $R5 $R5 + 1
         ${Loop}
         ${Break}
@@ -125,7 +148,6 @@ Function ParseProjectsSwitch
     ${EndIf}
     IntOp $R1 $R1 + 1
   ${Loop}
-  ${WordReplace} "$ProjectsRoot" "/" "\" "+*" $ProjectsRoot
 FunctionEnd
 
 ; Sets $NoDesktop to 1 when /NODESKTOP is a whole token of $CMDLINE. Tokens
@@ -161,8 +183,11 @@ Function ParseNoDesktopSwitch
 FunctionEnd
 
 Function .onInit
-  Call ParseProjectsSwitch
+  Push "/PROJECTS="
+  Call ParseValueSwitch
   ${If} $R9 == 1
+    ; "/" in the value becomes "\".
+    ${WordReplace} "$SwitchValue" "/" "\" "+*" $ProjectsRoot
     ; A given switch is never silently replaced by another folder.
     ${If} $ProjectsRoot == ""
       MessageBox MB_OK|MB_ICONSTOP "/PROJECTS= needs a folder, for example /PROJECTS=$\"D:\My projects$\"." /SD IDOK
@@ -171,7 +196,45 @@ Function .onInit
   ${Else}
     !insertmacro ResolveProjectsRoot
   ${EndIf}
+  !insertmacro ResolvePort
+  Push "/PORT="
+  Call ParseValueSwitch
+  ${If} $R9 == 1
+    ${If} $SwitchValue == ""
+      MessageBox MB_OK|MB_ICONSTOP "/PORT= needs a port, for example /PORT=9000." /SD IDOK
+      Abort
+    ${EndIf}
+    StrCpy $Port $SwitchValue
+  ${Else}
+    StrCpy $Port $PortResolved
+  ${EndIf}
   Call ParseNoDesktopSwitch
+FunctionEnd
+
+Var PortField
+
+Function PortPageShow
+  !insertmacro MUI_HEADER_TEXT "Port" "The local port code-conductor listens on."
+  nsDialogs::Create 1018
+  Pop $0
+  ${If} $0 == error
+    Abort
+  ${EndIf}
+  ${NSD_CreateLabel} 0 0 100% 36u "code-conductor runs at http://127.0.0.1:<port>/. Keep ${DEFAULT_PORT} unless another program uses it. The port is kept when you re-install."
+  Pop $0
+  ${NSD_CreateNumber} 0 44u 60u 12u "$Port"
+  Pop $PortField
+  SendMessage $PortField ${EM_LIMITTEXT} 5 0
+  nsDialogs::Show
+FunctionEnd
+
+; Range checking is setup.mjs's (checkPort); only an empty field stays here.
+Function PortPageLeave
+  ${NSD_GetText} $PortField $Port
+  ${If} $Port == ""
+    MessageBox MB_ICONEXCLAMATION "Enter a port from 1 to 65535."
+    Abort
+  ${EndIf}
 FunctionEnd
 
 Function CreateDesktopShortcut
@@ -213,9 +276,9 @@ FunctionEnd
   FileClose $R7
 !macroend
 
-; Whether anything answers 200 on cc's health endpoint (PORT or 8787, as the
+; Whether anything answers 200 on cc's health endpoint (PORT or the default, as the
 ; launcher probes it): exit 0 if so. Used only when there is no launcher.
-!define HEALTH_PROBE `fetch('http://127.0.0.1:'+(process.env.PORT||8787)+'/api/health',{signal:AbortSignal.timeout(3000)}).then(r=>process.exit(r.ok?0:1),()=>process.exit(1))`
+!define HEALTH_PROBE `fetch('http://127.0.0.1:'+(process.env.PORT||${DEFAULT_PORT})+'/api/health',{signal:AbortSignal.timeout(3000)}).then(r=>process.exit(r.ok?0:1),()=>process.exit(1))`
 
 ; Stops a running server (found through its health endpoint) after asking.
 ; A server only runs on this install's node, so without node.exe there is
@@ -243,7 +306,7 @@ FunctionEnd
           Abort "Could not stop the running code-conductor. See $INSTDIR\logs\setup.log"
         ${EndIf}
       ${ElseIf} $0 == 2
-        Abort "A server is answering on the code-conductor port but cannot be identified or stopped automatically. Close it, then run this again."
+        Abort "A server is answering on the code-conductor port ($PortResolved) but cannot be identified or stopped automatically. Close it, then run this again."
       ${EndIf}
     ${Else}
       nsExec::ExecToStack `"$INSTDIR\node\node.exe" -e "${HEALTH_PROBE}"`
@@ -271,6 +334,7 @@ Section "Install"
   File "${STAGE}\toolchain.mjs"
   File "${STAGE}\contract.mjs"
   File "${STAGE}\projects.mjs"
+  File "${STAGE}\port.mjs"
   File "${STAGE}\pins.json"
   ; Windows argv rule: backslashes before the closing quote escape it unless
   ; doubled, so each trailing backslash is doubled; a drive root reaches
@@ -284,7 +348,7 @@ Section "Install"
     StrCpy $R3 $R3 -1
     StrCpy $0 $R3 1 -1
   ${Loop}
-  nsExec::ExecToLog '"$INSTDIR\node\node.exe" "$PLUGINSDIR\setup.mjs" --install-dir "$INSTDIR" --source "${SOURCE}" --branch "${BRANCH}" --projects-root "$ProjectsRoot$R2"'
+  nsExec::ExecToLog '"$INSTDIR\node\node.exe" "$PLUGINSDIR\setup.mjs" --install-dir "$INSTDIR" --source "${SOURCE}" --branch "${BRANCH}" --projects-root "$ProjectsRoot$R2" --port "$Port"'
   Pop $0
   ; Nothing below runs on failure: the stub, uninstaller, Uninstall key
   ; (DisplayVersion) and shortcuts are written only after setup succeeded.
@@ -318,23 +382,34 @@ Section "Install"
     ${EndIf}
   ${EndIf}
 
+  ; Written only when it differs from what cc already runs on, so a default
+  ; install leaves the registry alone.
+  ${If} $Port != $PortResolved
+    WriteRegStr HKCU "${PORT_KEY}" "${PORT_NAME}" "$Port"
+    !insertmacro SetupLog "installer: port set to $Port (was $PortResolved)"
+  ${Else}
+    !insertmacro SetupLog "installer: port $Port (unchanged)"
+  ${EndIf}
   ; The finish page's Launch inherits this process's environment, which
   ; predates setup's PROJECTS_ROOT write.
   System::Call 'kernel32::SetEnvironmentVariable(t "PROJECTS_ROOT", t "$ProjectsRoot")'
+  System::Call 'kernel32::SetEnvironmentVariable(t "PORT", t "$Port")'
   ; the user PATH and PROJECTS_ROOT may have changed
   SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
   StrCpy $InstallOk 1
 SectionEnd
 
 ; Keeps the projects root (and the user PROJECTS_ROOT naming it) with its
-; store, Git, claude and the PATH entry.
+; store, the stored port, Git, claude and the PATH entry.
 Section "Uninstall"
   SetShellVarContext current
+  ; Names the port in StopRunning's messages and points it at the stored one.
+  !insertmacro ResolvePort
   !insertmacro StopRunning "u"
   Delete "$SMPROGRAMS\code-conductor.lnk"
   Delete "$DESKTOP\code-conductor.lnk"
   RMDir /r "$INSTDIR"
   DeleteRegKey HKCU "${UNINST_KEY}"
   !insertmacro ResolveProjectsRoot
-  DetailPrint "Kept: your projects ($ProjectsRoot), the user PROJECTS_ROOT variable, Git, claude and the user PATH entry."
+  DetailPrint "Kept: your projects ($ProjectsRoot), the user PROJECTS_ROOT variable, the port setting (HKCU\Software\code-conductor), Git, claude and the user PATH entry."
 SectionEnd

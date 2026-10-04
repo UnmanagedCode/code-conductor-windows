@@ -15,7 +15,7 @@ import { LAUNCHER_REL } from './contract.mjs';
 
 export const DEFAULT_SOURCE = 'https://github.com/UnmanagedCode/code-conductor.git';
 // This repo's files that ship inside the installer.
-const SHIPPED = ['setup.mjs', 'toolchain.mjs', 'contract.mjs', 'projects.mjs', 'pins.json', 'installer.nsi', 'launcher.nsi', 'icon.ico'];
+const SHIPPED = ['setup.mjs', 'toolchain.mjs', 'contract.mjs', 'projects.mjs', 'port.mjs', 'port.nsh', 'pins.json', 'installer.nsi', 'launcher.nsi', 'icon.ico'];
 const srcDir = path.dirname(fileURLToPath(import.meta.url));
 const repoDir = path.resolve(srcDir, '..');
 
