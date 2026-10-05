@@ -4,6 +4,8 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { ensureGit, downloadWithRetry, main } from '../src/setup.mjs';
 
 const buf = Buffer.from('installer bytes');
@@ -53,4 +55,38 @@ test('main with --port 0 rejects before any download', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-setup-port-'));
   try { await assert.rejects(main(setupArgs(dir, ['--port', '0']), {}), /whole number from 1 to 65535/); }
   finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+const setupCli = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'setup.mjs');
+const runCheck = (cwd, ...flags) => spawnSync(process.execPath, [setupCli, '--check', '--install-dir', 'C:\\inst', ...flags], { cwd, encoding: 'utf8' });
+
+// Invariant: --check reads exactly the accepted set of checkPort/checkProjectsRoot,
+// reports a refusal as exit 1 plus one stderr line (the contract the installer reads),
+// checks only the flags given, and writes nothing.
+test('--check: refusals exit 1 with one line, acceptances exit 0 silently, nothing is written', () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-setup-check-'));
+  try {
+    const refused = (flags, re) => {
+      const r = runCheck(cwd, ...flags);
+      assert.equal(r.status, 1, flags.join(' '));
+      assert.equal(r.stdout, '');
+      assert.match(r.stderr, re);
+      assert.equal(r.stderr.trim().split('\n').length, 1, r.stderr);
+    };
+    for (const p of ['abc', '0', '70000', '09123', '']) refused(['--port', p], /whole number from 1 to 65535/);
+    refused(['--projects-root', 'relative'], /must be an absolute path/);
+    refused(['--projects-root', 'C:\\inst\\p'], /must not be inside the install directory/);
+    refused(['--projects-root', 'D:\\p', '--port', '0'], /whole number from 1 to 65535/);
+    const ok = (...flags) => {
+      const r = runCheck(cwd, ...flags);
+      assert.deepEqual([r.status, r.stdout, r.stderr], [0, '', ''], flags.join(' '));
+    };
+    ok('--projects-root', 'D:\\p', '--port', '9000');
+    ok('--projects-root', 'D:\\p');
+    ok('--port', '9000');
+    const none = spawnSync(process.execPath, [setupCli, '--check', '--install-dir', 'C:\\inst'], { cwd, encoding: 'utf8' });
+    assert.equal(none.status, 1);
+    assert.match(none.stderr, /missing/);
+    assert.deepEqual(fs.readdirSync(cwd), []);
+  } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
 });

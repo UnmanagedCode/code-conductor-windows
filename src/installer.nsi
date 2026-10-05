@@ -49,6 +49,12 @@ Var PortResolved
 Var SwitchValue
 ; 1 when /NODESKTOP was given.
 Var NoDesktop
+; $ProjectsRoot as setup.mjs receives it inside double quotes (QuoteProjectsRoot).
+Var ProjectsArg
+; 1 once StageSetup has extracted setup.mjs and its node.exe.
+Var SetupStaged
+; CheckInputs' result: empty when setup's own check accepts the inputs, else the reason.
+Var CheckError
 
 SpaceTexts none
 !insertmacro MUI_PAGE_LICENSE "${STAGE}\LICENSE"
@@ -56,6 +62,7 @@ SpaceTexts none
 !define MUI_DIRECTORYPAGE_TEXT_TOP "Choose the folder that holds your projects and code-conductor's .code-conductor store. It is kept when you uninstall. Changing it does not move existing projects."
 !define MUI_DIRECTORYPAGE_TEXT_DESTINATION "Projects folder"
 !define MUI_DIRECTORYPAGE_VARIABLE $ProjectsRoot
+!define MUI_PAGE_CUSTOMFUNCTION_LEAVE ProjectsPageLeave
 !insertmacro MUI_PAGE_DIRECTORY
 Page custom PortPageShow PortPageLeave
 !insertmacro MUI_PAGE_INSTFILES
@@ -182,6 +189,18 @@ Function ParseNoDesktopSwitch
   ${EndWhile}
 FunctionEnd
 
+; Appends a line to logs\setup.log (setup.mjs's log) and the details pane,
+; so a silent run is auditable. TEXT must not contain a double quote.
+!macro SetupLog TEXT
+  DetailPrint "${TEXT}"
+  CreateDirectory "$INSTDIR\logs"
+  ${GetTime} "" "LS" $R0 $R1 $R2 $R3 $R4 $R5 $R6
+  FileOpen $R7 "$INSTDIR\logs\setup.log" a
+  FileSeek $R7 0 END
+  FileWrite $R7 "[$R2-$R1-$R0T$R4:$R5:$R6Z] ${TEXT}$\r$\n"
+  FileClose $R7
+!macroend
+
 Function .onInit
   Push "/PROJECTS="
   Call ParseValueSwitch
@@ -190,6 +209,7 @@ Function .onInit
     ${WordReplace} "$SwitchValue" "/" "\" "+*" $ProjectsRoot
     ; A given switch is never silently replaced by another folder.
     ${If} $ProjectsRoot == ""
+      !insertmacro SetupLog "installer: refused: /PROJECTS= needs a folder"
       MessageBox MB_OK|MB_ICONSTOP "/PROJECTS= needs a folder, for example /PROJECTS=$\"D:\My projects$\"." /SD IDOK
       Abort
     ${EndIf}
@@ -201,6 +221,7 @@ Function .onInit
   Call ParseValueSwitch
   ${If} $R9 == 1
     ${If} $SwitchValue == ""
+      !insertmacro SetupLog "installer: refused: /PORT= needs a port"
       MessageBox MB_OK|MB_ICONSTOP "/PORT= needs a port, for example /PORT=9000." /SD IDOK
       Abort
     ${EndIf}
@@ -209,6 +230,79 @@ Function .onInit
     StrCpy $Port $PortResolved
   ${EndIf}
   Call ParseNoDesktopSwitch
+FunctionEnd
+
+; Windows argv rule: backslashes before the closing quote escape it unless
+; doubled, so each trailing backslash is doubled; a drive root reaches
+; setup.mjs intact.
+; setup.mjs's checkProjectsRoot is the one place that strips a non-root one.
+; Leaves the result in $ProjectsArg, which every --projects-root passes.
+Function QuoteProjectsRoot
+  StrCpy $R2 ""
+  StrCpy $R3 $ProjectsRoot
+  StrCpy $R4 $R3 1 -1
+  ${DoWhile} $R4 == "\"
+    StrCpy $R2 "$R2\"
+    StrCpy $R3 $R3 -1
+    StrCpy $R4 $R3 1 -1
+  ${Loop}
+  StrCpy $ProjectsArg "$ProjectsRoot$R2"
+FunctionEnd
+
+; Extracts setup.mjs, its modules and the new bundled node.exe into
+; $PLUGINSDIR, once. setup.mjs is run with this node.exe, not
+; $INSTDIR\node\node.exe: a fresh install and the wizard pages have no
+; installed node yet, a re-install's may be an older version or locked by the
+; running cc, and node.exe needs no node_modules.
+Function StageSetup
+  ${If} $SetupStaged == 1
+    Return
+  ${EndIf}
+  InitPluginsDir
+  SetOutPath "$PLUGINSDIR"
+  File "${STAGE}\node\node.exe"
+  File "${STAGE}\setup.mjs"
+  File "${STAGE}\toolchain.mjs"
+  File "${STAGE}\contract.mjs"
+  File "${STAGE}\projects.mjs"
+  File "${STAGE}\port.mjs"
+  File "${STAGE}\pins.json"
+  StrCpy $SetupStaged 1
+FunctionEnd
+
+; Runs setup.mjs's own checks (--check) on the flags string on the stack, e.g.
+; --port "9000". Sets $CheckError: empty when accepted, else the reason. A
+; check that cannot run is an error too.
+Function CheckInputs
+  Exch $2
+  Push $0
+  Push $1
+  Call StageSetup
+  nsExec::ExecToStack '"$PLUGINSDIR\node.exe" "$PLUGINSDIR\setup.mjs" --check --install-dir "$INSTDIR" $2'
+  Pop $0
+  Pop $1
+  ${TrimNewLines} "$1" $1
+  ${If} $0 == 0
+    StrCpy $CheckError ""
+  ${ElseIf} $1 == ""
+    StrCpy $CheckError "the pre-install check could not run (exit $0)"
+  ${Else}
+    StrCpy $CheckError $1
+  ${EndIf}
+  Pop $1
+  Pop $0
+  Pop $2
+FunctionEnd
+
+; Stays on the directory page when setup would refuse the folder.
+Function ProjectsPageLeave
+  Call QuoteProjectsRoot
+  Push '--projects-root "$ProjectsArg"'
+  Call CheckInputs
+  ${If} $CheckError != ""
+    MessageBox MB_ICONEXCLAMATION "$CheckError"
+    Abort
+  ${EndIf}
 FunctionEnd
 
 Var PortField
@@ -228,11 +322,17 @@ Function PortPageShow
   nsDialogs::Show
 FunctionEnd
 
-; Range checking is setup.mjs's (checkPort); only an empty field stays here.
+; An empty field is refused here; anything else goes through setup's own check.
 Function PortPageLeave
   ${NSD_GetText} $PortField $Port
   ${If} $Port == ""
     MessageBox MB_ICONEXCLAMATION "Enter a port from 1 to 65535."
+    Abort
+  ${EndIf}
+  Push '--port "$Port"'
+  Call CheckInputs
+  ${If} $CheckError != ""
+    MessageBox MB_ICONEXCLAMATION "$CheckError"
     Abort
   ${EndIf}
 FunctionEnd
@@ -263,18 +363,6 @@ Function FinishPre
     Abort
   ${EndIf}
 FunctionEnd
-
-; Appends a line to logs\setup.log (setup.mjs's log) and the details pane,
-; so a silent run is auditable. TEXT must not contain a double quote.
-!macro SetupLog TEXT
-  DetailPrint "${TEXT}"
-  CreateDirectory "$INSTDIR\logs"
-  ${GetTime} "" "LS" $R0 $R1 $R2 $R3 $R4 $R5 $R6
-  FileOpen $R7 "$INSTDIR\logs\setup.log" a
-  FileSeek $R7 0 END
-  FileWrite $R7 "[$R2-$R1-$R0T$R4:$R5:$R6Z] ${TEXT}$\r$\n"
-  FileClose $R7
-!macroend
 
 ; Whether anything answers 200 on cc's health endpoint (PORT or the default, as the
 ; launcher probes it): exit 0 if so. Used only when there is no launcher.
@@ -322,33 +410,21 @@ FunctionEnd
 
 Section "Install"
   SetShellVarContext current
+  ; The guarantee for silent and wizard installs: refuse before anything is stopped.
+  Call QuoteProjectsRoot
+  Push '--projects-root "$ProjectsArg" --port "$Port"'
+  Call CheckInputs
+  ${If} $CheckError != ""
+    !insertmacro SetupLog "installer: refused before stopping anything: $CheckError"
+    Abort "$CheckError See $INSTDIR\logs\setup.log"
+  ${EndIf}
   !insertmacro StopRunning "i"
 
   RMDir /r "$INSTDIR\node"
   SetOutPath "$INSTDIR\node"
   File /r "${STAGE}\node\*.*"
 
-  InitPluginsDir
-  SetOutPath "$PLUGINSDIR"
-  File "${STAGE}\setup.mjs"
-  File "${STAGE}\toolchain.mjs"
-  File "${STAGE}\contract.mjs"
-  File "${STAGE}\projects.mjs"
-  File "${STAGE}\port.mjs"
-  File "${STAGE}\pins.json"
-  ; Windows argv rule: backslashes before the closing quote escape it unless
-  ; doubled, so each trailing backslash is doubled; a drive root reaches
-  ; setup.mjs intact.
-  ; setup.mjs's checkProjectsRoot is the one place that strips a non-root one.
-  StrCpy $R2 ""
-  StrCpy $R3 $ProjectsRoot
-  StrCpy $0 $R3 1 -1
-  ${DoWhile} $0 == "\"
-    StrCpy $R2 "$R2\"
-    StrCpy $R3 $R3 -1
-    StrCpy $0 $R3 1 -1
-  ${Loop}
-  nsExec::ExecToLog '"$INSTDIR\node\node.exe" "$PLUGINSDIR\setup.mjs" --install-dir "$INSTDIR" --source "${SOURCE}" --branch "${BRANCH}" --projects-root "$ProjectsRoot$R2" --port "$Port"'
+  nsExec::ExecToLog '"$INSTDIR\node\node.exe" "$PLUGINSDIR\setup.mjs" --install-dir "$INSTDIR" --source "${SOURCE}" --branch "${BRANCH}" --projects-root "$ProjectsArg" --port "$Port"'
   Pop $0
   ; Nothing below runs on failure: the stub, uninstaller, Uninstall key
   ; (DisplayVersion) and shortcuts are written only after setup succeeded.

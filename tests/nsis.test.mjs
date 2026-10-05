@@ -57,3 +57,51 @@ test('/PROJECTS= and /PORT= go through ParseValueSwitch', () => {
     assert.match(installer, new RegExp(`Push "${sw}"\\n\\s*Call ParseValueSwitch`));
   }
 });
+
+const fnBody = (name) => {
+  const a = installer.indexOf(`Function ${name}\n`);
+  assert.ok(a >= 0, `Function ${name} not found`);
+  return installer.slice(a, installer.indexOf('\nFunctionEnd', a));
+};
+
+// Invariant: a refused projects folder or port is refused before anything is stopped.
+test('Section Install checks the inputs and aborts before StopRunning', () => {
+  const sec = installer.slice(installer.indexOf('Section "Install"'), installer.indexOf('Section "Uninstall"'));
+  const check = sec.indexOf('Call CheckInputs');
+  const stop = sec.indexOf('!insertmacro StopRunning');
+  assert.ok(check > 0 && check < stop);
+  const abort = sec.indexOf('Abort', check);
+  assert.ok(abort > check && abort < stop);
+});
+
+// Invariant: the check does not depend on the old or missing $INSTDIR\node.
+test('CheckInputs runs setup --check with the node.exe StageSetup extracts', () => {
+  assert.ok(fnBody('CheckInputs').includes('"$PLUGINSDIR\\node.exe" "$PLUGINSDIR\\setup.mjs" --check'));
+  assert.ok(fnBody('StageSetup').includes('File "${STAGE}\\node\\node.exe"'));
+});
+
+// Invariant: the wizard validates both pages with setup's own check.
+test('both page leaves call CheckInputs', () => {
+  assert.ok(fnBody('ProjectsPageLeave').includes('Call CheckInputs'));
+  assert.ok(fnBody('PortPageLeave').includes('Call CheckInputs'));
+  assert.match(installer, /!define MUI_PAGE_CUSTOMFUNCTION_LEAVE ProjectsPageLeave\n!insertmacro MUI_PAGE_DIRECTORY/);
+});
+
+// Invariant: a silent startup refusal leaves a line in setup.log.
+test('every Abort in .onInit is preceded by a SetupLog line, and the macro is defined first', () => {
+  const body = fnBody('.onInit').split('\n');
+  const aborts = body.flatMap((l, i) => (l.trim() === 'Abort' ? [i] : []));
+  assert.equal(aborts.length, 2);
+  for (const i of aborts) {
+    const before = body.slice(0, i).reverse().find((l) => l.trim() && !l.includes('MessageBox'));
+    assert.match(before, /!insertmacro SetupLog/);
+  }
+  assert.ok(installer.indexOf('!macro SetupLog') < installer.indexOf('Function .onInit'));
+});
+
+// Invariant: the check and setup see the same, backslash-doubled folder string.
+test('every --projects-root passes $ProjectsArg', () => {
+  const hits = installer.match(/--projects-root "[^\n]*/g) ?? [];
+  assert.ok(hits.length >= 3);
+  for (const h of hits) assert.match(h, /^--projects-root "\$ProjectsArg"/, h);
+});
