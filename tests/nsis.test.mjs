@@ -105,3 +105,24 @@ test('every --projects-root passes $ProjectsArg', () => {
   assert.ok(hits.length >= 3);
   for (const h of hits) assert.match(h, /^--projects-root "\$ProjectsArg"/, h);
 });
+
+// Invariant: $ProjectsArg is computed (QuoteProjectsRoot) before the Install
+// section and the directory page leave push it, so it is never an empty string.
+test('Section Install and ProjectsPageLeave call QuoteProjectsRoot before pushing $ProjectsArg', () => {
+  const sec = installer.slice(installer.indexOf('Section "Install"'), installer.indexOf('Section "Uninstall"'));
+  for (const [name, body] of [['Section Install', sec], ['ProjectsPageLeave', fnBody('ProjectsPageLeave')]]) {
+    const quote = body.indexOf('Call QuoteProjectsRoot');
+    assert.ok(quote >= 0 && quote < body.indexOf('--projects-root "$ProjectsArg"'), name);
+  }
+});
+
+// Invariant (static shape only; the NSIS runtime cannot run here): every
+// trailing backslash of $ProjectsRoot is doubled into $ProjectsArg, which is
+// what keeps a drive root such as D:\ from escaping the closing quote.
+test('QuoteProjectsRoot doubles each trailing backslash', () => {
+  const body = fnBody('QuoteProjectsRoot');
+  assert.ok(body.includes('${DoWhile} $R4 == "\\"'));
+  assert.ok(body.includes('StrCpy $R2 "$R2\\"'));
+  assert.ok(body.includes('StrCpy $R3 $R3 -1'));
+  assert.ok(body.includes('StrCpy $ProjectsArg "$ProjectsRoot$R2"'));
+});
