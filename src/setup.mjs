@@ -1,5 +1,8 @@
 // Install-time CLI, run by the installer with the bundled node:
 //   node setup.mjs --install-dir D --source URL --branch X --projects-root P --port N
+//   node setup.mjs --check --install-dir D [--projects-root P] [--port N]
+// The second form only validates the given flags (exit 0, or exit 1 with one
+// line on stderr) and writes nothing; the installer runs it before stopping cc.
 // Validates the projects folder and port (warning if the port is in use), ensures Git for Windows and claude, puts
 // claude's dir on the user PATH, clones/fast-forwards cc's latest <X> from URL
 // into <D>\app and checks it against the installer contract, runs `npm ci`,
@@ -312,9 +315,30 @@ export async function checkout({ git, source, dir, branch, nodeVersion, log, env
 // Every flag main requires; the installer must pass all of them.
 export const REQUIRED_ARGS = ['install-dir', 'source', 'branch', 'projects-root', 'port'];
 
-export async function main(argv, env = process.env) {
+function parseArgs(argv) {
   const args = {};
   for (let i = 0; i < argv.length; i += 2) args[argv[i].replace(/^--/, '')] = argv[i + 1];
+  return args;
+}
+
+// Validates whichever of projects-root / port is present; an empty value is
+// checked (and refused), not skipped.
+function checkInputs(args) {
+  const projectsRoot = 'projects-root' in args ? checkProjectsRoot(args['projects-root'], args['install-dir']) : undefined;
+  const port = 'port' in args ? checkPort(args.port) : undefined;
+  return { projectsRoot, port };
+}
+
+// No side effects: no log file, no directories.
+export function check(argv) {
+  const args = parseArgs(argv);
+  if (!args['install-dir']) throw new Error('missing --install-dir');
+  if (!('projects-root' in args) && !('port' in args)) throw new Error('missing --projects-root or --port');
+  return checkInputs(args);
+}
+
+export async function main(argv, env = process.env) {
+  const args = parseArgs(argv);
   for (const k of REQUIRED_ARGS) {
     if (!args[k]) throw new Error(`missing --${k}`);
   }
@@ -322,8 +346,7 @@ export async function main(argv, env = process.env) {
   const log = makeLogger(path.join(installDir, 'logs', 'setup.log'));
   const pins = JSON.parse(fs.readFileSync(new URL('./pins.json', import.meta.url), 'utf8'));
   // Before any download: a bad folder should fail in seconds.
-  const projectsRoot = checkProjectsRoot(args['projects-root'], installDir);
-  const port = checkPort(args.port);
+  const { projectsRoot, port } = checkInputs(args);
   await warnIfPortTaken(port, { log });
 
   const git = await ensureGit({ env, pin: pins.git, log });
@@ -348,7 +371,14 @@ export async function main(argv, env = process.env) {
   log('setup complete');
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href && process.argv[2] === '--check') {
+  try {
+    check(process.argv.slice(3));
+  } catch (e) {
+    console.error(e.message);
+    process.exit(1);
+  }
+} else if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main(process.argv.slice(2)).catch((e) => {
     console.error(stamp(`setup failed: ${e.message}`));
     try { fs.appendFileSync(path.join(process.argv[process.argv.indexOf('--install-dir') + 1], 'logs', 'setup.log'), `${stamp(`setup failed: ${e.stack}`)}\n`); } catch {}
