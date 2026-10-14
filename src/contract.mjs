@@ -6,6 +6,8 @@ export const CONTRACT_URL = 'https://github.com/UnmanagedCode/code-conductor/blo
 // installer's StopRunning get it as the LAUNCHER define.
 export const LAUNCHER_REL = 'bin/windows-launch.mjs';
 const ENGINES_RE = /^>=\s*(\d+)(?:\.(\d+))?(?:\.(\d+))?$/;
+// cc's own root scripts npm runs on install; `--ignore-scripts` skips them.
+const LIFECYCLE = ['preinstall', 'install', 'postinstall', 'prepublish', 'preprepare', 'prepare', 'postprepare'];
 
 const versionParts = (v) => v.split('.').map(Number);
 
@@ -28,7 +30,7 @@ export function satisfiesEngines(version, range) {
 export async function contractProblems(read, nodeVersion) {
   const problems = [];
   const files = {};
-  for (const f of [LAUNCHER_REL, 'package.json', 'package-lock.json', 'LICENSE']) {
+  for (const f of [LAUNCHER_REL, 'package.json', 'LICENSE']) {
     files[f] = await read(f);
     if (files[f] === null) problems.push(`${f} is missing`);
   }
@@ -37,18 +39,26 @@ export async function contractProblems(read, nodeVersion) {
     try { pkg = JSON.parse(files['package.json']); } catch (e) { problems.push(`package.json does not parse: ${e.message}`); }
   }
   if (typeof pkg.version !== 'string') problems.push('package.json has no string "version"');
-  // `npm ci` on the user's machine has only the bundled node + npm, no build toolchain.
-  if (files['package-lock.json'] !== null) {
-    try {
-      const scripted = Object.entries(JSON.parse(files['package-lock.json']).packages ?? {}).filter(([, p]) => p.hasInstallScript).map(([k]) => k);
-      if (scripted.length) problems.push(`package-lock.json has packages with install scripts: ${scripted.join(', ')}`);
-    } catch (e) { problems.push(`package-lock.json does not parse: ${e.message}`); }
-  }
+  const lifecycle = LIFECYCLE.filter((k) => Object.hasOwn(pkg.scripts ?? {}, k));
+  if (lifecycle.length) problems.push(`package.json has install lifecycle scripts, which the installer does not run: ${lifecycle.join(', ')}`);
   const range = pkg.engines?.node;
   const ok = typeof range === 'string' ? satisfiesEngines(nodeVersion, range) : null;
   if (ok === null) problems.push(`package.json engines.node ${JSON.stringify(range)} is not of the form >=N[.N[.N]]`);
   else if (!ok) problems.push(`the bundled Node ${nodeVersion} does not satisfy engines.node "${range}"`);
   return { problems, version: pkg.version };
+}
+
+// `text` is node_modules/.package-lock.json after `npm install
+// --ignore-scripts` (npm's record of the tree it installed, skipped
+// platform-optional packages left out), or null when absent. The user's
+// machine has only the bundled node + npm, no build toolchain, so every
+// package whose install script was skipped is a problem.
+export function installScriptProblems(text) {
+  if (text === null) return ['node_modules/.package-lock.json is missing'];
+  let packages;
+  try { packages = JSON.parse(text).packages ?? {}; } catch (e) { return [`node_modules/.package-lock.json does not parse: ${e.message}`]; }
+  const scripted = Object.entries(packages).filter(([, p]) => p.hasInstallScript).map(([k]) => k);
+  return scripted.length ? [`packages with install scripts: ${scripted.join(', ')}`] : [];
 }
 
 // The failed checks as a message tail for the caller to embed.

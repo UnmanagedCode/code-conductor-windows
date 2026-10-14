@@ -11,7 +11,8 @@ const git = (cwd, ...args) => execFileSync('git', ['-C', cwd, ...args], { encodi
 const LAUNCHER = 'bin/windows-launch.mjs';
 
 // seed (working repo) -> origin.git (stands in for GitHub, the installer's
-// source). The seed passes the installer contract; `commit` advances origin.
+// source). The seed passes the installer contract and tracks no
+// package-lock.json; `commit` advances origin.
 function setup() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-checkout-'));
   const seed = path.join(root, 'seed');
@@ -21,7 +22,6 @@ function setup() {
   git(seed, 'config', 'user.email', 't@t');
   git(seed, 'config', 'user.name', 't');
   fs.writeFileSync(path.join(seed, 'package.json'), '{"name":"code-conductor","version":"1.0.0","engines":{"node":">=24"}}\n');
-  fs.writeFileSync(path.join(seed, 'package-lock.json'), '{"lockfileVersion":3,"packages":{"":{"name":"code-conductor"}}}\n');
   fs.writeFileSync(path.join(seed, 'LICENSE'), 'license\n');
   fs.writeFileSync(path.join(seed, 'conductor.sh'), '#!/usr/bin/env bash\nexec true\n');
   fs.writeFileSync(path.join(seed, 'bin', 'windows-launch.mjs'), '// launcher\n');
@@ -59,7 +59,8 @@ const commitIn = (t, msg, file = 'local.txt') => {
 };
 // A checkout config() snapshot: what a failing checkout must leave alone.
 const config = (t) => [git(t.dir, 'remote', 'get-url', 'origin'), localCfg(t, 'core.autocrlf')];
-const scriptedLock = JSON.stringify({ packages: { '': {}, 'node_modules/native': { hasInstallScript: true } } });
+// A package.json that fails the contract: a root install lifecycle script.
+const scriptedPkg = '{"name":"code-conductor","version":"1.0.0","engines":{"node":">=24"},"scripts":{"postinstall":"x"}}\n';
 
 // Invariant: a fresh install clones the source's branch with upstream, sets
 // origin to the source, LF endings and autocrlf=false, a clean tree; it logs
@@ -208,7 +209,7 @@ test('a blocked fast-forward that then fails the contract does not promise a sel
 // Invariant: a failing existing checkout keeps its git config (origin,
 // autocrlf) rather than having the source's origin written over it, whether it
 // fails as diverged or because its own HEAD no longer meets the contract (a
-// local commit adding an install-script package).
+// local commit adding a root postinstall script).
 test('a failing existing checkout keeps its git config: origin and autocrlf untouched', async () => {
   const t = setup();
   try {
@@ -217,10 +218,10 @@ test('a failing existing checkout keeps its git config: origin and autocrlf unto
     execFileSync('git', ['-C', t.dir, 'remote', 'set-url', 'origin', 'https://example.invalid/mine.git'], { env: t.env });
     const before = config(t);
 
-    fs.writeFileSync(path.join(t.dir, 'package-lock.json'), scriptedLock);
-    commitIn(t, 'native dep');
+    fs.writeFileSync(path.join(t.dir, 'package.json'), scriptedPkg);
+    commitIn(t, 'postinstall');
     const err = await checkout(t.args()).then(() => assert.fail('kept'), (e) => e);
-    assert.match(err.message, /package-lock\.json has packages with install scripts: node_modules\/native/);
+    assert.match(err.message, /install lifecycle scripts.*postinstall/);
     assert.match(err.message, /uninstall code-conductor/);
     assert.deepEqual(config(t), before);
 
@@ -236,10 +237,10 @@ test('a failing existing checkout keeps its git config: origin and autocrlf unto
 test('fresh install whose tip fails the contract fails and removes app\\', async () => {
   const t = setup();
   try {
-    fs.writeFileSync(path.join(t.seed, 'package-lock.json'), scriptedLock);
-    const tip = t.commit('native dep');
+    fs.writeFileSync(path.join(t.seed, 'package.json'), scriptedPkg);
+    const tip = t.commit('postinstall');
     const err = await checkout(t.args()).then(() => assert.fail('installed'), (e) => e);
-    assert.match(err.message, /package-lock\.json has packages with install scripts: node_modules\/native/);
+    assert.match(err.message, /install lifecycle scripts.*postinstall/);
     assert.ok(err.message.includes(CONTRACT_URL) && err.message.includes(tip.slice(0, 8)), err.message);
     assert.equal(fs.existsSync(t.dir), false);
   } finally { t.cleanup(); }
