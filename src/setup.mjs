@@ -193,7 +193,14 @@ export async function installDeps({ node, npmCli, dir, env, log, run = runLogged
   log('npm: npm install --ignore-scripts');
   await mustRun(log, node, [npmCli, 'install', '--ignore-scripts'], { cwd: dir, env }, run);
   const hidden = path.join(dir, 'node_modules', '.package-lock.json');
-  const problems = installScriptProblems(fs.existsSync(hidden) ? fs.readFileSync(hidden, 'utf8') : null);
+  // A read failure (an AV scanner holding the file, a directory there) is a
+  // problem like a missing one, so the user gets the framed message.
+  let problems;
+  try {
+    problems = installScriptProblems(fs.readFileSync(hidden, 'utf8'));
+  } catch (e) {
+    problems = e.code === 'ENOENT' ? installScriptProblems(null) : [`node_modules/.package-lock.json cannot be read: ${e.message}`];
+  }
   if (problems.length) {
     throw new Error('cc\'s dependencies cannot be installed: the installer does not run install scripts (it has no build toolchain):'
       + `${contractError(problems)}\n${RETRY_LATER}`);

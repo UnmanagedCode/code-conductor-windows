@@ -43,16 +43,19 @@ test('downloadWithRetry: an HTTP error status is retried and reported', async ()
 });
 
 // installDeps in a fresh dir, with a fake npm that records its call, exits
-// `code` and leaves `hidden` (null: nothing) as node_modules/.package-lock.json.
-async function withInstall({ code = 0, hidden }, fn) {
+// `code` and leaves `hidden` (null: nothing; `asDir`: a directory) as
+// node_modules/.package-lock.json.
+async function withInstall({ code = 0, hidden, asDir = false }, fn) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-setup-deps-'));
   const calls = [];
   const lines = [];
   const run = async (log, file, args, opts) => {
     calls.push({ file, args, opts });
-    if (hidden !== null) {
-      fs.mkdirSync(path.join(dir, 'node_modules'), { recursive: true });
-      fs.writeFileSync(path.join(dir, 'node_modules', '.package-lock.json'), hidden);
+    const hiddenFile = path.join(dir, 'node_modules', '.package-lock.json');
+    if (asDir) fs.mkdirSync(hiddenFile, { recursive: true });
+    else if (hidden !== null) {
+      fs.mkdirSync(path.dirname(hiddenFile), { recursive: true });
+      fs.writeFileSync(hiddenFile, hidden);
     }
     return code;
   };
@@ -97,6 +100,19 @@ test('installDeps: an installed package with an install script rejects naming it
 test('installDeps: a missing hidden lockfile rejects', async () => {
   await withInstall({ hidden: null }, async (go) => {
     await assert.rejects(go(), /node_modules\/\.package-lock\.json is missing/);
+  });
+});
+
+// Invariant: a hidden lockfile that exists but cannot be read fails setup
+// with the framed message (problem named, contract URL, retry tail), not a
+// raw fs error.
+test('installDeps: an unreadable hidden lockfile rejects with the framed message', async () => {
+  await withInstall({ asDir: true }, async (go) => {
+    const err = await go().then(() => assert.fail('resolved'), (e) => e);
+    assert.match(err.message, /^cc's dependencies cannot be installed: /);
+    assert.match(err.message, /- node_modules\/\.package-lock\.json cannot be read: EISDIR/);
+    assert.ok(err.message.includes(CONTRACT_URL), err.message);
+    assert.match(err.message, /Try again later, or use a newer installer release\.$/);
   });
 });
 
