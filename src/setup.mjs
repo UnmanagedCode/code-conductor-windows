@@ -5,7 +5,8 @@
 // line on stderr) and writes nothing; the installer runs it before stopping cc.
 // Validates the projects folder and port (warning if the port is in use), ensures Git for Windows and claude, puts
 // claude's dir on the user PATH, clones/fast-forwards cc's latest <X> from URL
-// into <D>\app and checks it against the installer contract, runs `npm ci`,
+// into <D>\app and checks it against the installer contract, runs `npm install
+// --ignore-scripts` and checks no installed package has an install script,
 // and saves the projects folder as the user PROJECTS_ROOT.
 // Progress goes to stdout (the installer's details pane) and logs\setup.log.
 // Any failure exits nonzero, which aborts the installer.
@@ -16,7 +17,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { detectGit, detectClaude, addToUserPath, envKey, getEnv, splitPath } from './toolchain.mjs';
-import { contractProblems, contractError } from './contract.mjs';
+import { contractProblems, contractError, installScriptProblems } from './contract.mjs';
 import { checkProjectsRoot, persistProjectsRoot } from './projects.mjs';
 import { checkPort, warnIfPortTaken } from './port.mjs';
 
@@ -74,8 +75,8 @@ export function runPowerShell(script, input, exe = 'powershell.exe') {
   });
 }
 
-async function mustRun(log, file, args, opts) {
-  const code = await runLogged(log, file, args, opts);
+async function mustRun(log, file, args, opts, run = runLogged) {
+  const code = await run(log, file, args, opts);
   if (code !== 0) throw new Error(`${path.basename(file)} ${args.slice(0, 2).join(' ')} failed (exit ${code})`);
 }
 
@@ -183,6 +184,22 @@ const showAt = (git, dir, rev, env) => async (rel) => {
   return r.code === 0 ? r.stdout : null;
 };
 
+const RETRY_LATER = 'Try again later, or use a newer installer release.';
+
+// Installs cc's dependencies in `dir` with `node` + `npmCli`, from its
+// package.json ranges (or its lock, when the ref tracks one), running no
+// install script, then refuses any installed package that has one.
+export async function installDeps({ node, npmCli, dir, env, log, run = runLogged }) {
+  log('npm: npm install --ignore-scripts');
+  await mustRun(log, node, [npmCli, 'install', '--ignore-scripts'], { cwd: dir, env }, run);
+  const hidden = path.join(dir, 'node_modules', '.package-lock.json');
+  const problems = installScriptProblems(fs.existsSync(hidden) ? fs.readFileSync(hidden, 'utf8') : null);
+  if (problems.length) {
+    throw new Error('cc\'s dependencies cannot be installed: the installer does not run install scripts (it has no build toolchain):'
+      + `${contractError(problems)}\n${RETRY_LATER}`);
+  }
+}
+
 const RECOVER = 'To recover, uninstall code-conductor (Apps & features), then run this installer again; your projects in the projects root are kept.';
 
 // A network git command (clone/fetch), retried like downloadWithRetry: the
@@ -244,7 +261,7 @@ export async function checkout({ git, source, dir, branch, nodeVersion, log, env
       const short = await head('--short=8');
       fs.rmSync(dir, { recursive: true, force: true });
       throw new Error(`The latest cc ${branch} (${short}) from ${source} cannot be installed: it does not meet the installer contract:${contractError(problems)}\n`
-        + 'Try again later, or use a newer installer release.');
+        + RETRY_LATER);
     }
   } else {
     log(`checkout: existing checkout at ${dir}`);
@@ -358,15 +375,14 @@ export async function main(argv, env = process.env) {
   }
 
   const appDir = path.join(installDir, 'app');
-  // Bundled node first, so `npm ci` and its children use the bundled npm.
+  // Bundled node first, so `npm install` and its children use the bundled npm.
   const pathKey = envKey(env, 'PATH') || 'Path';
   const toolEnv = { ...env, [pathKey]: [w.join(installDir, 'node'), git.cmdDir, ...splitPath(getEnv(env, 'PATH'))].join(';') };
   // The running node is the bundled one.
   await checkout({ git: git.gitExe, source: args.source, dir: appDir, branch: args.branch, nodeVersion: process.versions.node, log, env: toolEnv });
 
-  log('npm: npm ci');
   const npmCli = path.join(installDir, 'node', 'node_modules', 'npm', 'bin', 'npm-cli.js');
-  await mustRun(log, path.join(installDir, 'node', 'node.exe'), [npmCli, 'ci'], { cwd: appDir, env: toolEnv });
+  await installDeps({ node: path.join(installDir, 'node', 'node.exe'), npmCli, dir: appDir, env: toolEnv, log });
   await persistProjectsRoot(projectsRoot, { runPs: runPowerShell, env, log });
   log('setup complete');
 }
