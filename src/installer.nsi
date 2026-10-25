@@ -420,9 +420,13 @@ Section "Install"
   ${EndIf}
   !insertmacro StopRunning "i"
 
+  !insertmacro SetupLog "installer: replacing node\ with the bundled Node.js"
+  ; One list line for thousands of files; their names still pass through the status bar.
+  SetDetailsPrint textonly
   RMDir /r "$INSTDIR\node"
   SetOutPath "$INSTDIR\node"
   File /r "${STAGE}\node\*.*"
+  SetDetailsPrint both
 
   nsExec::ExecToLog '"$INSTDIR\node\node.exe" "$PLUGINSDIR\setup.mjs" --install-dir "$INSTDIR" --source "${SOURCE}" --branch "${BRANCH}" --projects-root "$ProjectsArg" --port "$Port"'
   Pop $0
@@ -436,7 +440,6 @@ Section "Install"
   File "${STAGE}\code-conductor.exe"
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
-  ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
   WriteRegStr HKCU "${UNINST_KEY}" "DisplayName" "code-conductor"
   WriteRegStr HKCU "${UNINST_KEY}" "DisplayVersion" "${VERSION}"
   WriteRegStr HKCU "${UNINST_KEY}" "Publisher" "UnmanagedCode"
@@ -446,7 +449,8 @@ Section "Install"
   WriteRegStr HKCU "${UNINST_KEY}" "DisplayIcon" "$INSTDIR\code-conductor.exe"
   WriteRegDWORD HKCU "${UNINST_KEY}" "NoModify" 1
   WriteRegDWORD HKCU "${UNINST_KEY}" "NoRepair" 1
-  WriteRegDWORD HKCU "${UNINST_KEY}" "EstimatedSize" $0
+  ; No size: a walk of $INSTDIR takes minutes, and app\ changes with every self-update.
+  DeleteRegValue HKCU "${UNINST_KEY}" "EstimatedSize"
 
   CreateShortcut "$SMPROGRAMS\code-conductor.lnk" "$INSTDIR\code-conductor.exe" "" "$INSTDIR\code-conductor.exe" 0
   ; The finish page's checkbox decides otherwise; silent installs never show it.

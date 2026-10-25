@@ -126,3 +126,36 @@ test('QuoteProjectsRoot doubles each trailing backslash', () => {
   assert.ok(body.includes('StrCpy $R3 $R3 -1'));
   assert.ok(body.includes('StrCpy $ProjectsArg "$ProjectsRoot$R2"'));
 });
+
+// Invariant: nothing slow and silent runs after `setup complete` (no walk of
+// $INSTDIR), and a re-install leaves no stale size from an older installer;
+// a failed setup (Abort) writes nothing.
+test('the installer never walks $INSTDIR and leaves no stale EstimatedSize', () => {
+  assert.ok(!installer.includes('${GetSize}'));
+  assert.ok(!/WriteReg\w+\s+HKCU\s+"\$\{UNINST_KEY\}"\s+"EstimatedSize"/.test(installer));
+  const sec = installer.slice(installer.indexOf('Section "Install"'), installer.indexOf('Section "Uninstall"'));
+  const abort = sec.indexOf('Abort "Setup failed');
+  const del = sec.indexOf('DeleteRegValue HKCU "${UNINST_KEY}" "EstimatedSize"');
+  assert.ok(abort >= 0, 'setup-failure Abort not found');
+  assert.ok(del >= 0, 'EstimatedSize delete not found');
+  assert.ok(del > abort, 'delete must follow the setup Abort');
+});
+
+// Invariant: the per-file flood never reaches the details list, and setup's
+// progress lines are never hidden.
+test('node\\ is replaced under one summary line and the details pane is restored before setup runs', () => {
+  const sec = installer.slice(installer.indexOf('Section "Install"'), installer.indexOf('Section "Uninstall"'));
+  const order = [
+    '!insertmacro SetupLog "installer: replacing node\\',
+    'SetDetailsPrint textonly',
+    'RMDir /r "$INSTDIR\\node"',
+    'File /r "${STAGE}\\node\\*.*"',
+    'SetDetailsPrint both',
+    'nsExec::ExecToLog',
+  ].map((s) => sec.indexOf(s));
+  assert.ok(order.every((i) => i >= 0), order.join());
+  assert.deepEqual([...order].sort((a, b) => a - b), order);
+  const modes = [...installer.matchAll(/^\s*SetDetailsPrint\s+(\S+)/gm)].map((m) => m[1]);
+  assert.ok(modes.length % 2 === 0);
+  modes.forEach((m, i) => assert.equal(m, i % 2 ? 'both' : 'textonly'));
+});
