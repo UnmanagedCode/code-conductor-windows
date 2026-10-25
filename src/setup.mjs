@@ -186,12 +186,23 @@ const showAt = (git, dir, rev, env) => async (rel) => {
 
 const RETRY_LATER = 'Try again later, or use a newer installer release.';
 
+// When npm's output is not a terminal it shows no progress (its spinner needs
+// a TTY, and higher log levels print one line per request), so installDeps
+// logs a line this often to show it is still working.
+export const HEARTBEAT_MS = 15_000;
+
 // Installs cc's dependencies in `dir` with `node` + `npmCli`, from its
 // package.json ranges (or its lock, when the ref tracks one), running no
 // install script, then refuses any installed package that has one.
 export async function installDeps({ node, npmCli, dir, env, log, run = runLogged }) {
   log('npm: npm install --ignore-scripts');
-  await mustRun(log, node, [npmCli, 'install', '--ignore-scripts'], { cwd: dir, env }, run);
+  let beats = 0;
+  const beat = setInterval(() => log(`npm: still installing (${(++beats * HEARTBEAT_MS) / 1000} s)`), HEARTBEAT_MS);
+  try {
+    await mustRun(log, node, [npmCli, 'install', '--ignore-scripts'], { cwd: dir, env }, run);
+  } finally {
+    clearInterval(beat);
+  }
   const hidden = path.join(dir, 'node_modules', '.package-lock.json');
   // A read failure (an AV scanner holding the file, a directory there) is a
   // problem like a missing one, so the user gets the framed message.
