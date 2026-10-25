@@ -134,8 +134,11 @@ test('the installer never walks $INSTDIR and leaves no stale EstimatedSize', () 
   assert.ok(!installer.includes('${GetSize}'));
   assert.ok(!/WriteReg\w+\s+HKCU\s+"\$\{UNINST_KEY\}"\s+"EstimatedSize"/.test(installer));
   const sec = installer.slice(installer.indexOf('Section "Install"'), installer.indexOf('Section "Uninstall"'));
+  const abort = sec.indexOf('Abort "Setup failed');
   const del = sec.indexOf('DeleteRegValue HKCU "${UNINST_KEY}" "EstimatedSize"');
-  assert.ok(del > sec.indexOf('Abort "Setup failed'), 'delete must follow the setup Abort');
+  assert.ok(abort >= 0, 'setup-failure Abort not found');
+  assert.ok(del >= 0, 'EstimatedSize delete not found');
+  assert.ok(del > abort, 'delete must follow the setup Abort');
 });
 
 // Invariant: the per-file flood never reaches the details list, and setup's
